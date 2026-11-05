@@ -1,0 +1,81 @@
+:root {
+  color-scheme: light;
+
+  --font-sans: "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-serif: "Newsreader Variable", "Newsreader", Georgia, "Times New Roman", serif;
+
+  --bg: #f5f1e8;
+  --bg-raised: #fbf8f1;
+  --bg-sunken: #ece4d5;
+  --bg-translucent: rgba(245, 241, 232, 0.88);
+  --ink: #211d17;
+  --ink-soft: #4e483d;
+  --ink-muted: #7d7567;
+  --ink-faint: #a49b8b;
+  --line: #ddd3c2;
+  --line-strong: #c7bba6;
+  --accent: #a8402c;
+  --accent-strong: #852f1f;
+  --accent-soft: rgba(168, 64, 44, 0.09);
+  --focus: #2b6b6d;
+  --positive: #3f6f4f;
+
+  --cat-markets-energy: #98501b;
+  --cat-markets-energy-soft: rgba(152, 80, 27, 0.09);
+  --cat-ai-technology: #2d5685;
+  --cat-ai-technology-soft: rgba(45, 86, 133, 0.09);
+  --cat-general: #7d3c4b;
+  --cat-general-soft: rgba(125, 60, 75, 0.09);
+
+  --shadow-soft: 0 1px 2px rgba(33, 29, 23, 0.04), 0 8px 24px rgba(33, 29, 23, 0.04);
+  --shadow-lift: 0 2px 4px rgba(33, 29, 23, 0.06), 0 14px 36px rgba(33, 29, 23, 0.09);
+
+  --radius-sm: 3px;
+  --radius-md: 6px;
+  --radius-pill: 999px;
+
+  --max-width: 1240px;
+  --reading-width: 760px;
+  --gutter: clamp(1rem, 3.4vw, 2.5rem);
+  --header-height: 74px;
+
+  --text-xs: 0.72rem;
+  --text-sm: 0.82rem;
+  --text-base: 1rem;
+  --text-lg: 1.12rem;
+  --text-xl: clamp(1.35rem, 2vw, 1.6rem);
+  --text-2xl: clamp(1.7rem, 3vw, 2.25rem);
+  --text-display: clamp(2.35rem, 5.2vw, 4rem);
+
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #14130f;
+  --bg-raised: #1c1a15;
+  --bg-sunken: #0e0d0a;
+  --bg-translucent: rgba(20, 19, 15, 0.86);
+  --ink: #f0e9db;
+  --ink-soft: #c7bfaf;
+  --ink-muted: #948c7c;
+  --ink-faint: #6d665a;
+  --line: #342f27;
+  --line-strong: #4a4336;
+  --accent: #e07b5f;
+  --accent-strong: #f0957d;
+  --accent-soft: rgba(224, 123, 95, 0.12);
+  --focus: #7fc0c2;
+  --positive: #86b897;
+
+  --cat-markets-energy: #dda362;
+  --cat-markets-energy-soft: rgba(221, 163, 98, 0.12);
+  --cat-ai-technology: #87b3e6;
+  --cat-ai-technology-soft: rgba(135, 179, 230, 0.12);
+  --cat-general: #dc95a5;
+  --cat-general-soft: rgba(220, 149, 165, 0.12);
+
+  --shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.3), 0 10px 28px rgba(0, 0, 0, 0.22);
+  --shadow-lift: 0 2px 6px rgba(0, 0, 0, 0.34), 0 18px 44px rgba(0, 0, 0, 0.32);
+}

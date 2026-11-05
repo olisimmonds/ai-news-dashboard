@@ -1,0 +1,361 @@
+# Meridian news sources.
+#
+# All feeds below were verified as publicly accessible RSS/Atom feeds at the
+# time of writing. They are free to use and require no API keys. Individual
+# feeds can be disabled by setting enabled = false.
+#
+# categories: markets-energy | ai-technology | general
+# default_kind (optional): major | research | opinion | company | routine
+
+[[sources]]
+id = "bbc-business"
+name = "BBC Business"
+url = "https://www.bbc.co.uk/news/business"
+feed_url = "https://feeds.bbci.co.uk/news/business/rss.xml"
+categories = ["markets-energy"]
+
+[[sources]]
+id = "cnbc-markets"
+name = "CNBC Markets"
+url = "https://www.cnbc.com/markets/"
+feed_url = "https://www.cnbc.com/id/20910258/device/rss/rss.html"
+categories = ["markets-energy"]
+
+[[sources]]
+id = "cnbc-energy"
+name = "CNBC Energy"
+url = "https://www.cnbc.com/energy/"
+feed_url = "https://www.cnbc.com/id/19836768/device/rss/rss.html"
+categories = ["markets-energy"]
+
+[[sources]]
+id = "guardian-business"
+name = "The Guardian Business"
+url = "https://www.theguardian.com/uk/business"
+feed_url = "https://www.theguardian.com/uk/business/rss"
+categories = ["markets-energy"]
+
+[[sources]]
+id = "ft-home"
+name = "Financial Times"
+url = "https://www.ft.com/"
+feed_url = "https://www.ft.com/rss/home"
+categories = ["markets-energy", "general"]
+
+[[sources]]
+id = "ft-companies"
+name = "Financial Times Companies"
+url = "https://www.ft.com/companies"
+feed_url = "https://www.ft.com/rss/companies"
+categories = ["markets-energy"]
+
+[[sources]]
+id = "eia-today"
+name = "EIA Today in Energy"
+url = "https://www.eia.gov/todayinenergy/"
+feed_url = "https://www.eia.gov/rss/todayinenergy.xml"
+categories = ["markets-energy"]
+
+[[sources]]
+id = "ofgem"
+name = "Ofgem"
+url = "https://www.ofgem.gov.uk/"
+feed_url = "https://www.gov.uk/search/news-and-communications.atom?organisations%5B%5D=ofgem"
+categories = ["markets-energy"]
+
+[[sources]]
+id = "desnz"
+name = "DESNZ"
+url = "https://www.gov.uk/government/organisations/department-for-energy-security-and-net-zero"
+feed_url = "https://www.gov.uk/search/news-and-communications.atom?organisations%5B%5D=department-for-energy-security-and-net-zero"
+categories = ["markets-energy", "general"]
+
+[[sources]]
+id = "elexon"
+name = "Elexon"
+url = "https://www.elexon.co.uk/"
+feed_url = "https://www.elexon.co.uk/feed/"
+categories = ["markets-energy"]
+
+[[sources]]
+id = "carbon-brief"
+name = "Carbon Brief"
+url = "https://www.carbonbrief.org/"
+feed_url = "https://www.carbonbrief.org/feed/"
+categories = ["markets-energy", "general"]
+
+[[sources]]
+id = "utility-dive"
+name = "Utility Dive"
+url = "https://www.utilitydive.com/"
+feed_url = "https://www.utilitydive.com/feeds/news/"
+categories = ["markets-energy"]
+
+[[sources]]
+id = "oilprice"
+name = "OilPrice.com"
+url = "https://oilprice.com/"
+feed_url = "https://oilprice.com/rss/main"
+categories = ["markets-energy"]
+
+[[sources]]
+id = "energy-live-news"
+name = "Energy Live News"
+url = "https://www.energylivenews.com/"
+feed_url = "https://www.energylivenews.com/feed/"
+categories = ["markets-energy"]
+
+[[sources]]
+id = "pv-magazine"
+name = "pv magazine"
+url = "https://www.pv-magazine.com/"
+feed_url = "https://www.pv-magazine.com/feed/"
+categories = ["markets-energy"]
+
+[[sources]]
+id = "windpower-monthly"
+name = "Windpower Monthly"
+url = "https://www.windpowermonthly.com/"
+feed_url = "https://www.windpowermonthly.com/rss/news"
+categories = ["markets-energy"]
+
+[[sources]]
+id = "bank-of-england"
+name = "Bank of England"
+url = "https://www.bankofengland.co.uk/news"
+feed_url = "https://www.bankofengland.co.uk/rss/news"
+categories = ["markets-energy"]
+
+[[sources]]
+id = "ecb"
+name = "European Central Bank"
+url = "https://www.ecb.europa.eu/press/html/index.en.html"
+feed_url = "https://www.ecb.europa.eu/rss/press.html"
+categories = ["markets-energy"]
+
+[[sources]]
+id = "federal-reserve"
+name = "Federal Reserve"
+url = "https://www.federalreserve.gov/newsevents.htm"
+feed_url = "https://www.federalreserve.gov/feeds/press_monetary.xml"
+categories = ["markets-energy"]
+
+[[sources]]
+id = "marketwatch"
+name = "MarketWatch"
+url = "https://www.marketwatch.com/"
+feed_url = "https://feeds.content.dowjones.io/public/rss/mw_topstories"
+categories = ["markets-energy"]
+
+[[sources]]
+id = "economist-finance"
+name = "The Economist — Finance"
+url = "https://www.economist.com/finance-and-economics"
+feed_url = "https://www.economist.com/finance-and-economics/rss.xml"
+categories = ["markets-energy", "general"]
+
+[[sources]]
+id = "economist-business"
+name = "The Economist — Business"
+url = "https://www.economist.com/business"
+feed_url = "https://www.economist.com/business/rss.xml"
+categories = ["markets-energy", "general"]
+
+[[sources]]
+id = "openai"
+name = "OpenAI"
+url = "https://openai.com/news/"
+feed_url = "https://openai.com/news/rss.xml"
+categories = ["ai-technology"]
+
+[[sources]]
+id = "deepmind"
+name = "Google DeepMind"
+url = "https://deepmind.google/discover/blog/"
+feed_url = "https://deepmind.google/blog/rss.xml"
+categories = ["ai-technology"]
+
+[[sources]]
+id = "google-ai"
+name = "Google AI"
+url = "https://blog.google/technology/ai/"
+feed_url = "https://blog.google/technology/ai/rss/"
+categories = ["ai-technology"]
+
+[[sources]]
+id = "microsoft-research"
+name = "Microsoft Research"
+url = "https://www.microsoft.com/en-us/research/blog/"
+feed_url = "https://www.microsoft.com/en-us/research/feed/"
+categories = ["ai-technology"]
+default_kind = "research"
+
+[[sources]]
+id = "nvidia"
+name = "NVIDIA"
+url = "https://blogs.nvidia.com/"
+feed_url = "https://blogs.nvidia.com/feed/"
+categories = ["ai-technology"]
+
+[[sources]]
+id = "mit-tech-review"
+name = "MIT Technology Review"
+url = "https://www.technologyreview.com/"
+feed_url = "https://www.technologyreview.com/feed/"
+categories = ["ai-technology"]
+
+[[sources]]
+id = "ars-technica"
+name = "Ars Technica"
+url = "https://arstechnica.com/"
+feed_url = "https://feeds.arstechnica.com/arstechnica/index"
+categories = ["ai-technology"]
+
+[[sources]]
+id = "techcrunch"
+name = "TechCrunch"
+url = "https://techcrunch.com/"
+feed_url = "https://techcrunch.com/feed/"
+categories = ["ai-technology"]
+
+[[sources]]
+id = "the-verge"
+name = "The Verge"
+url = "https://www.theverge.com/"
+feed_url = "https://www.theverge.com/rss/index.xml"
+categories = ["ai-technology"]
+
+[[sources]]
+id = "huggingface"
+name = "Hugging Face"
+url = "https://huggingface.co/blog"
+feed_url = "https://huggingface.co/blog/feed.xml"
+categories = ["ai-technology"]
+
+[[sources]]
+id = "wired"
+name = "WIRED"
+url = "https://www.wired.com/"
+feed_url = "https://www.wired.com/feed/rss"
+categories = ["ai-technology"]
+
+[[sources]]
+id = "arxiv-ai"
+name = "arXiv cs.AI"
+url = "https://arxiv.org/list/cs.AI/recent"
+feed_url = "https://export.arxiv.org/rss/cs.AI"
+categories = ["ai-technology"]
+default_kind = "research"
+
+[[sources]]
+id = "bair"
+name = "Berkeley AI Research"
+url = "https://bair.berkeley.edu/blog/"
+feed_url = "https://bair.berkeley.edu/blog/feed.xml"
+categories = ["ai-technology"]
+default_kind = "research"
+
+[[sources]]
+id = "simon-willison"
+name = "Simon Willison"
+url = "https://simonwillison.net/"
+feed_url = "https://simonwillison.net/atom/everything/"
+categories = ["ai-technology"]
+
+[[sources]]
+id = "bbc-news"
+name = "BBC News"
+url = "https://www.bbc.co.uk/news"
+feed_url = "https://feeds.bbci.co.uk/news/rss.xml"
+categories = ["general"]
+
+[[sources]]
+id = "bbc-uk"
+name = "BBC UK"
+url = "https://www.bbc.co.uk/news/uk"
+feed_url = "https://feeds.bbci.co.uk/news/uk/rss.xml"
+categories = ["general"]
+
+[[sources]]
+id = "bbc-world"
+name = "BBC World"
+url = "https://www.bbc.co.uk/news/world"
+feed_url = "https://feeds.bbci.co.uk/news/world/rss.xml"
+categories = ["general"]
+
+[[sources]]
+id = "bbc-science"
+name = "BBC Science & Environment"
+url = "https://www.bbc.co.uk/news/science_and_environment"
+feed_url = "https://feeds.bbci.co.uk/news/science_and_environment/rss.xml"
+categories = ["general"]
+
+[[sources]]
+id = "sky-news"
+name = "Sky News"
+url = "https://news.sky.com/"
+feed_url = "https://feeds.skynews.com/feeds/rss/home.xml"
+categories = ["general"]
+
+[[sources]]
+id = "sky-politics"
+name = "Sky News Politics"
+url = "https://news.sky.com/uk/politics"
+feed_url = "https://feeds.skynews.com/feeds/rss/politics.xml"
+categories = ["general"]
+
+[[sources]]
+id = "guardian-uk"
+name = "The Guardian UK"
+url = "https://www.theguardian.com/uk"
+feed_url = "https://www.theguardian.com/uk/rss"
+categories = ["general"]
+
+[[sources]]
+id = "guardian-world"
+name = "The Guardian World"
+url = "https://www.theguardian.com/world"
+feed_url = "https://www.theguardian.com/world/rss"
+categories = ["general"]
+
+[[sources]]
+id = "npr"
+name = "NPR"
+url = "https://www.npr.org/sections/news/"
+feed_url = "https://feeds.npr.org/1001/rss.xml"
+categories = ["general"]
+
+[[sources]]
+id = "al-jazeera"
+name = "Al Jazeera"
+url = "https://www.aljazeera.com/"
+feed_url = "https://www.aljazeera.com/xml/rss/all.xml"
+categories = ["general"]
+
+[[sources]]
+id = "politico-europe"
+name = "Politico Europe"
+url = "https://www.politico.eu/"
+feed_url = "https://www.politico.eu/feed/"
+categories = ["general"]
+
+[[sources]]
+id = "nature"
+name = "Nature"
+url = "https://www.nature.com/nature/"
+feed_url = "https://www.nature.com/nature.rss"
+categories = ["general", "ai-technology"]
+
+[[sources]]
+id = "science-daily"
+name = "ScienceDaily"
+url = "https://www.sciencedaily.com/"
+feed_url = "https://www.sciencedaily.com/rss/all.xml"
+categories = ["general"]
+
+[[sources]]
+id = "dow-jones-world"
+name = "Dow Jones Newswires"
+url = "https://www.dowjones.com/"
+feed_url = "https://feeds.a.dj.com/rss/RSSWorldNews.xml"
+categories = ["general"]

@@ -8,3 +8,21 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local configuration and data
+.env
+.env.*
+!.env.example
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Frontend build artifacts
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
