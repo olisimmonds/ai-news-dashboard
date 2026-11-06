@@ -198,6 +198,14 @@ docker logs --tail 200 --timestamps meridian-firefox-smoke
 
 Open <http://127.0.0.1:6080/vnc_lite.html> to confirm Firefox is visible. A 200 from noVNC only proves that websockify is serving; it does not prove Firefox started. Meridian also waits for a visible Firefox window and logs the container state plus its last 200 log lines before cleaning up a failed session. On the Pi, check those diagnostics with `journalctl -u meridian -n 200 --no-pager`.
 
+Meridian invokes the Docker CLI directly; it does not use the Docker Python SDK. Failed commands now log their full command line, stdout, stderr and exit status. To test the X window lookup manually:
+
+```bash
+docker ps --filter label=meridian.browser.session=1 --format '{{.Names}}'
+docker exec --user 1000 --env XAUTHORITY=/home/browser/.Xauthority <container-name> \
+  xdotool search --onlyvisible --limit 1 'meridian-browser|MeridianBrowser|Firefox'
+```
+
 ```bash
 docker rm -f meridian-firefox-smoke
 ```

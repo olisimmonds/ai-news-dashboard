@@ -32,6 +32,24 @@ class BrowserError(RuntimeError):
     pass
 
 
+class DockerCommandError(BrowserError):
+    def __init__(
+        self,
+        command: tuple[str, ...],
+        stdout: str,
+        stderr: str,
+        returncode: int,
+        *,
+        summary: str = "Docker command failed",
+    ) -> None:
+        self.command = command
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+        output = "\n".join(part for part in (stderr, stdout) if part) or "(no output)"
+        super().__init__(f"{summary} ({' '.join(command)}), exit {returncode}:\n{output}")
+
+
 class BrowserUnavailable(BrowserError):
     pass
 
@@ -80,6 +98,16 @@ class DockerRuntime:
         self._available: bool | None = None
         self._checked_at = 0.0
 
+    def _browser_exec(self, name: str) -> tuple[str, ...]:
+        return (
+            "exec",
+            "--user",
+            _BROWSER_UID,
+            "--env",
+            f"XAUTHORITY={_BROWSER_XAUTHORITY}",
+            name,
+        )
+
     async def _execute(self, *args: str, timeout: float = 20.0) -> tuple[str, str, int]:
         try:
             process = await asyncio.create_subprocess_exec(
@@ -111,7 +139,9 @@ class DockerRuntime:
     async def _run(self, *args: str, timeout: float = 20.0, check: bool = True) -> str:
         stdout, stderr, returncode = await self._execute(*args, timeout=timeout)
         if check and returncode != 0:
-            raise BrowserError(stderr or f"Docker command failed: {' '.join(args[:2])}")
+            error = DockerCommandError(args, stdout, stderr, returncode)
+            logger.error("%s", error)
+            raise error
         return stdout
 
     async def available(self) -> bool:
@@ -119,17 +149,20 @@ class DockerRuntime:
         if self._available is not None and now - self._checked_at < 15:
             return self._available
         try:
-            await self._run("version", "--format", "{{.Server.Version}}", timeout=5)
-            self._available = True
+            _stdout, _stderr, returncode = await self._execute(
+                "version", "--format", "{{.Server.Version}}", timeout=5
+            )
+            self._available = returncode == 0
         except BrowserError:
             self._available = False
         self._checked_at = now
         return self._available
 
     async def _ensure_network(self) -> None:
-        try:
-            await self._run("network", "inspect", self._network, timeout=10)
-        except BrowserError:
+        _stdout, _stderr, returncode = await self._execute(
+            "network", "inspect", self._network, timeout=10
+        )
+        if returncode != 0:
             await self._run(
                 "network",
                 "create",
@@ -231,9 +264,47 @@ class DockerRuntime:
             diagnostics = "diagnostics unavailable"
         logger.error("Browser container %s failed during startup: %s\n%s", name, error, diagnostics)
 
+    async def _find_window_once(self, name: str) -> tuple[str | None, str, str, int]:
+        stdout, stderr, returncode = await self._execute(
+            *self._browser_exec(name),
+            "xdotool",
+            *_WINDOW_SEARCH,
+            timeout=5,
+        )
+        window = None
+        if returncode == 0:
+            window = next(
+                (line.strip() for line in stdout.splitlines() if line.strip().isdigit()),
+                None,
+            )
+        return window, stdout, stderr, returncode
+
+    async def _find_window(self, name: str, timeout: float = 5.0) -> str:
+        deadline = time.monotonic() + timeout
+        command = (*self._browser_exec(name), "xdotool", *_WINDOW_SEARCH)
+        stdout = ""
+        stderr = ""
+        returncode = 0
+        while True:
+            window, stdout, stderr, returncode = await self._find_window_once(name)
+            if window is not None:
+                return window
+            if time.monotonic() >= deadline:
+                error = DockerCommandError(
+                    command,
+                    stdout,
+                    stderr,
+                    returncode,
+                    summary="Could not find the Firefox window",
+                )
+                logger.error("%s", error)
+                raise error
+            await asyncio.sleep(0.25)
+
     async def wait_ready(self, name: str, port: int, timeout: float = 45.0) -> None:
         deadline = time.monotonic() + timeout
         display_ready = False
+        window_error = "The Firefox window has not been searched for yet."
         async with httpx.AsyncClient(timeout=2.0) as client:
             while time.monotonic() < deadline:
                 if not display_ready:
@@ -244,21 +315,18 @@ class DockerRuntime:
                         pass
 
                 if display_ready:
-                    try:
-                        await self._run(
-                            "exec",
-                            "--user",
-                            _BROWSER_UID,
-                            "--env",
-                            f"XAUTHORITY={_BROWSER_XAUTHORITY}",
-                            name,
-                            "xdotool",
-                            *_WINDOW_SEARCH,
-                            timeout=5,
-                        )
+                    window, stdout, stderr, returncode = await self._find_window_once(name)
+                    if window is not None:
                         return
-                    except BrowserError:
-                        pass
+                    window_error = str(
+                        DockerCommandError(
+                            (*self._browser_exec(name), "xdotool", *_WINDOW_SEARCH),
+                            stdout,
+                            stderr,
+                            returncode,
+                            summary="Firefox window search failed",
+                        )
+                    )
 
                 if not await self.is_running(name):
                     raise BrowserUnavailable("The browser container exited during startup.")
@@ -266,6 +334,7 @@ class DockerRuntime:
 
         if not display_ready:
             raise BrowserUnavailable("The browser display did not start in time.")
+        logger.error("Firefox window not ready in %s: %s", name, window_error)
         raise BrowserUnavailable("The browser window did not start in time.")
 
     async def remove(self, name: str) -> None:
@@ -284,13 +353,13 @@ class DockerRuntime:
             return False
 
     async def run_command(self, name: str, args: list[str]) -> None:
+        window = await self._find_window(name)
         await self._run(
-            "exec",
-            "--user",
-            _BROWSER_UID,
-            "--env",
-            f"XAUTHORITY={_BROWSER_XAUTHORITY}",
-            name,
+            *self._browser_exec(name),
+            "xdotool",
+            "windowactivate",
+            "--sync",
+            window,
             *args,
             timeout=15,
         )
@@ -461,7 +530,7 @@ class BrowserSessionManager:
         self, session_id: str, username: str, url: str, *, new_tab: bool = False
     ) -> BrowserSession:
         session = self.get(session_id, username)
-        args = [*_WINDOW_SEARCH, "windowactivate", "--sync"]
+        args: list[str] = []
         if new_tab:
             args.extend(["key", "--clearmodifiers", "ctrl+t"])
         args.extend(
@@ -495,14 +564,7 @@ class BrowserSessionManager:
             raise BrowserError(f"Unknown browser action: {action}")
         await self._runtime.run_command(
             session.container,
-            [
-                *_WINDOW_SEARCH,
-                "windowactivate",
-                "--sync",
-                "key",
-                "--clearmodifiers",
-                key,
-            ],
+            ["key", "--clearmodifiers", key],
         )
         session.last_activity = self._clock()
         return session

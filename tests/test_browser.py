@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from ai_dashboard.browser.auth import BrowserAuth, hash_password, save_accounts, verify_password
 from ai_dashboard.browser.sessions import (
     _WINDOW_SEARCH,
+    BrowserError,
     BrowserLimitReached,
     BrowserSessionManager,
     BrowserUnavailable,
@@ -175,7 +176,7 @@ def test_browser_requires_auth_and_can_start_a_session(
     assert "view_only" not in payload["vnc_url"]
     assert len(runtime.starts) == 1
     assert len(runtime.commands) == 1
-    assert "meridian-browser|MeridianBrowser|Firefox" in runtime.commands[0][1]
+    assert runtime.commands[0][1][0] == "key"
     assert "https://example.com" in runtime.commands[0][1]
 
 
@@ -391,6 +392,9 @@ def test_docker_start_reports_diagnostics_before_cleanup(
             return "127.0.0.1:32770"
         return ""
 
+    async def fake_execute(*args: str, timeout: float = 20.0) -> tuple[str, str, int]:
+        return "", "", 0
+
     async def fake_diagnostics(name: str) -> str:
         events.append("diagnostics")
         return "state: exited\nlogs:\nFirefox failed to start"
@@ -399,6 +403,7 @@ def test_docker_start_reports_diagnostics_before_cleanup(
         events.append("wait_ready")
         raise BrowserUnavailable("The browser window did not start in time.")
 
+    monkeypatch.setattr(runtime, "_execute", fake_execute)
     monkeypatch.setattr(runtime, "_run", fake_run)
     monkeypatch.setattr(runtime, "_diagnostics", fake_diagnostics)
     monkeypatch.setattr(runtime, "wait_ready", fake_wait_ready)
@@ -422,3 +427,97 @@ def test_docker_start_reports_diagnostics_before_cleanup(
     cleanup_index = max(index for index, event in enumerate(events) if event == "run:rm")
     assert events.index("diagnostics") < cleanup_index
     assert "Firefox failed to start" in caplog.text
+
+
+def test_docker_run_command_uses_browser_user_and_window_id(
+    browser_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = DockerRuntime(browser_settings)
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_execute(*args: str, timeout: float = 20.0) -> tuple[str, str, int]:
+        calls.append(args)
+        if "search" in args:
+            return "12345\n", "", 0
+        return "", "", 0
+
+    monkeypatch.setattr(runtime, "_execute", fake_execute)
+
+    asyncio.run(
+        runtime.run_command(
+            "meridian-browser-test",
+            ["key", "--clearmodifiers", "ctrl+l"],
+        )
+    )
+
+    assert len(calls) == 2
+    search, action = calls
+    prefix = (
+        "exec",
+        "--user",
+        "1000",
+        "--env",
+        "XAUTHORITY=/home/browser/.Xauthority",
+        "meridian-browser-test",
+        "xdotool",
+    )
+    assert search[:7] == prefix
+    assert search[7:] == _WINDOW_SEARCH
+    assert action[:7] == prefix
+    assert action[7:] == (
+        "windowactivate",
+        "--sync",
+        "12345",
+        "key",
+        "--clearmodifiers",
+        "ctrl+l",
+    )
+
+
+def test_docker_command_error_preserves_stdout_and_full_command(
+    browser_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = DockerRuntime(browser_settings)
+
+    async def fake_execute(*args: str, timeout: float = 20.0) -> tuple[str, str, int]:
+        return "xdotool: search failed\n", "", 1
+
+    monkeypatch.setattr(runtime, "_execute", fake_execute)
+
+    with pytest.raises(BrowserError) as caught:
+        asyncio.run(runtime._run("exec", "--user", "1000", "container", "xdotool"))
+
+    message = str(caught.value)
+    assert "exec --user 1000 container xdotool" in message
+    assert "exit 1" in message
+    assert "xdotool: search failed" in message
+
+
+def test_find_window_failure_preserves_xdotool_stderr(
+    browser_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = DockerRuntime(browser_settings)
+
+    async def fake_execute(*args: str, timeout: float = 20.0) -> tuple[str, str, int]:
+        return "", "Authorization required, but no authorization protocol specified", 1
+
+    monkeypatch.setattr(runtime, "_execute", fake_execute)
+
+    with pytest.raises(BrowserError) as caught:
+        asyncio.run(runtime._find_window("meridian-browser-test", timeout=0))
+
+    message = str(caught.value)
+    assert "Could not find the Firefox window" in message
+    assert "exec --user 1000" in message
+    assert "Authorization required" in message
+
+
+def test_browser_image_uses_uid_1000() -> None:
+    dockerfile = (
+        Path(__file__).resolve().parents[1] / "docker" / "firefox" / "Dockerfile"
+    ).read_text(encoding="utf-8")
+
+    assert "--uid 1000" in dockerfile
