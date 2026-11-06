@@ -1,4 +1,14 @@
-import type { Article, Briefing, Meta, SourceInfo, Stats, Story } from "../lib/types";
+import type {
+  Article,
+  Briefing,
+  BrowserFavourite,
+  BrowserSession,
+  BrowserStatus,
+  Meta,
+  SourceInfo,
+  Stats,
+  Story,
+} from "../lib/types";
 
 const NOW = new Date("2026-11-03T09:00:00.000Z");
 
@@ -148,3 +158,35 @@ export const briefing: Briefing = {
   stats,
   generated_at: NOW.toISOString(),
 };
+
+export function makeBrowserSession(overrides: Partial<BrowserSession> = {}): BrowserSession {
+  return {
+    id: "session-1",
+    created_at: NOW.toISOString(),
+    last_activity_at: NOW.toISOString(),
+    idle_timeout_minutes: 20,
+    vnc_url: "/api/browser/sessions/session-1/vnc/vnc_lite.html",
+    ...overrides,
+  };
+}
+
+export function makeBrowserStatus(overrides: Partial<BrowserStatus> = {}): BrowserStatus {
+  return {
+    enabled: true,
+    authenticated: false,
+    user: null,
+    accounts_configured: true,
+    docker_available: true,
+    setup_message: null,
+    max_sessions: 2,
+    active_sessions: 0,
+    idle_timeout_minutes: 20,
+    session: null,
+    ...overrides,
+  };
+}
+
+export const browserFavourites: BrowserFavourite[] = [
+  { title: "DuckDuckGo", url: "https://duckduckgo.com/" },
+  { title: "Hacker News", url: "https://news.ycombinator.com/" },
+];

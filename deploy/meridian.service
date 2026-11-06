@@ -1,0 +1,17 @@
+[Unit]
+Description=Meridian news and private browser dashboard
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/ai-news-dashboard
+EnvironmentFile=-/home/pi/ai-news-dashboard/.env
+Environment=AI_DASHBOARD_HOST=127.0.0.1
+ExecStart=/home/pi/ai-news-dashboard/.venv/bin/ai-dashboard
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

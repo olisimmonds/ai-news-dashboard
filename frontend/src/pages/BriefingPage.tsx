@@ -154,12 +154,7 @@ export function BriefingPage() {
 
           {briefing.latest.length > 0 ? (
             <section className="latest-section" aria-labelledby="latest-heading">
-              <SectionHeading
-                eyebrow="Chronological"
-                title="Latest"
-                to="/news"
-                linkLabel="Browse the archive"
-              />
+              <SectionHeading eyebrow="Chronological" title="Latest" />
               <div className="latest-list">
                 {briefing.latest.map((article) => (
                   <ArticleCard key={article.id} article={article} variant="latest" />

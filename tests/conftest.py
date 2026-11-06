@@ -31,6 +31,7 @@ def settings(tmp_path: Path) -> Settings:
         request_timeout_seconds=5,
         max_concurrent_fetches=3,
         image_enrichment_enabled=False,
+        browser_enabled=False,
     )
 
 

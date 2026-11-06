@@ -11,7 +11,6 @@ import { useArticleFeed } from "../hooks/useArticleFeed";
 import { useDebouncedValue } from "../hooks/useDebouncedValue";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { useMeta } from "../hooks/useMeta";
-import { CATEGORIES } from "../lib/categories";
 import { formatCount } from "../lib/format";
 import type { CategoryId, SortOrder } from "../lib/types";
 
@@ -20,18 +19,10 @@ interface FeedPageProps {
   eyebrow: string;
   description: string;
   category?: CategoryId;
-  showCategoryFilter: boolean;
   documentTitle: string;
 }
 
-export function FeedPage({
-  title,
-  eyebrow,
-  description,
-  category,
-  showCategoryFilter,
-  documentTitle,
-}: FeedPageProps) {
+export function FeedPage({ title, eyebrow, description, category, documentTitle }: FeedPageProps) {
   useDocumentTitle(documentTitle);
   const { meta } = useMeta();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -39,8 +30,6 @@ export function FeedPage({
   const [searchInput, setSearchInput] = useState(urlQuery);
   const debouncedSearch = useDebouncedValue(searchInput, 300);
 
-  const urlCategory = CATEGORIES.find((item) => item.id === searchParams.get("category"))?.id;
-  const selectedCategory = category ?? urlCategory;
   const source = searchParams.get("source") ?? "";
   const sort: SortOrder = searchParams.get("sort") === "oldest" ? "oldest" : "newest";
   const focusSearch = searchParams.get("focus") === "search";
@@ -63,16 +52,14 @@ export function FeedPage({
   );
 
   const feed = useArticleFeed({
-    category: selectedCategory,
+    category,
     source: source || undefined,
     q: debouncedSearch.trim() || undefined,
     sort,
     limit: 30,
   });
 
-  const hasFilters = Boolean(
-    searchInput.trim() || source || sort !== "newest" || (!category && selectedCategory),
-  );
+  const hasFilters = Boolean(searchInput.trim() || source || sort !== "newest");
 
   function onSearchChange(value: string) {
     setSearchInput(value);
@@ -84,7 +71,6 @@ export function FeedPage({
     setSearchParams(new URLSearchParams(), { replace: true });
   }
 
-  const categoryCounts = meta?.stats.category_counts;
   const noArticlesAtAll = (meta?.stats.total_articles ?? 0) === 0;
 
   return (
@@ -108,10 +94,6 @@ export function FeedPage({
       <FilterBar
         searchValue={searchInput}
         onSearchChange={onSearchChange}
-        category={selectedCategory}
-        showCategoryFilter={showCategoryFilter}
-        onCategoryChange={(value) => updateParams({ category: value })}
-        categoryCounts={categoryCounts}
         source={source}
         onSourceChange={(value) => updateParams({ source: value || undefined })}
         sources={meta?.sources ?? []}
@@ -150,8 +132,8 @@ export function FeedPage({
               ) : noArticlesAtAll ? (
                 <RefreshButton />
               ) : (
-                <Link to="/news" className="button-secondary">
-                  Browse all news
+                <Link to="/" className="button-secondary">
+                  Back to the briefing
                 </Link>
               )
             }

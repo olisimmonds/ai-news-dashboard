@@ -19,7 +19,6 @@ export function CategoryPage() {
       eyebrow="The desk"
       description={category.description}
       category={category.id}
-      showCategoryFilter={false}
       documentTitle={category.label}
     />
   );

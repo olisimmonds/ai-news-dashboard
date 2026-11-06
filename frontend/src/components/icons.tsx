@@ -26,6 +26,50 @@ export function ArrowUpRight(props: IconProps) {
   );
 }
 
+export function ArrowLeft(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path d="M20 12H4" />
+      <path d="m10 6-6 6 6 6" />
+    </svg>
+  );
+}
+
+export function Home(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path d="m3 11 9-8 9 8" />
+      <path d="M5 10v10h14V10" />
+      <path d="M9 20v-6h6v6" />
+    </svg>
+  );
+}
+
+export function Plus(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path d="M12 5v14M5 12h14" />
+    </svg>
+  );
+}
+
+export function Trash(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13" />
+      <path d="M10 11v5M14 11v5" />
+    </svg>
+  );
+}
+
+export function Maximize(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path d="M8 3H3v5M16 3h5v5M21 16v5h-5M3 16v5h5" />
+    </svg>
+  );
+}
+
 export function ArrowRight(props: IconProps) {
   return (
     <svg {...base(props)}>

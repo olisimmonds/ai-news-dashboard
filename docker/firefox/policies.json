@@ -1,0 +1,112 @@
+{
+  "policies": {
+    "AppAutoUpdate": false,
+    "BlockAboutConfig": true,
+    "DisableAppUpdate": true,
+    "DisableDeveloperTools": true,
+    "DisableFeedbackCommands": true,
+    "DisableFirefoxAccounts": true,
+    "DisableFirefoxScreenshots": true,
+    "DisableFirefoxStudies": true,
+    "DisablePocket": true,
+    "DisableProfileImport": true,
+    "DisableTelemetry": true,
+    "DisplayBookmarksToolbar": "never",
+    "DontCheckDefaultBrowser": true,
+    "EnableTrackingProtection": {
+      "Value": true,
+      "Locked": true,
+      "Cryptomining": true,
+      "EmailTracking": true
+    },
+    "ExtensionSettings": {
+      "*": {
+        "installation_mode": "blocked"
+      },
+      "uBlock0@raymondhill.net": {
+        "installation_mode": "force_installed",
+        "install_url": "https://addons.mozilla.org/firefox/downloads/latest/ublock-origin/latest.xpi"
+      }
+    },
+    "Homepage": {
+      "URL": "about:blank",
+      "StartPage": "none",
+      "Locked": true
+    },
+    "NewTabPage": false,
+    "NoDefaultBookmarks": true,
+    "OfferToSaveLogins": false,
+    "OverrideFirstRunPage": "",
+    "OverridePostUpdatePage": "",
+    "PasswordManagerEnabled": false,
+    "PopupBlocking": {
+      "Default": true,
+      "Locked": true
+    },
+    "Preferences": {
+      "app.update.auto": {
+        "Value": false,
+        "Status": "locked"
+      },
+      "app.update.enabled": {
+        "Value": false,
+        "Status": "locked"
+      },
+      "browser.download.alwaysOpenPanel": {
+        "Value": false,
+        "Status": "default"
+      },
+      "browser.download.dir": {
+        "Value": "/home/browser/Downloads",
+        "Status": "locked"
+      },
+      "browser.download.useDownloadDir": {
+        "Value": true,
+        "Status": "locked"
+      },
+      "browser.newtabpage.enabled": {
+        "Value": false,
+        "Status": "locked"
+      },
+      "browser.shell.checkDefaultBrowser": {
+        "Value": false,
+        "Status": "locked"
+      },
+      "browser.startup.homepage": {
+        "Value": "about:blank",
+        "Status": "locked"
+      },
+      "browser.startup.page": {
+        "Value": 0,
+        "Status": "locked"
+      },
+      "datareporting.policy.dataSubmissionEnabled": {
+        "Value": false,
+        "Status": "locked"
+      },
+      "permissions.default.camera": {
+        "Value": 2,
+        "Status": "locked"
+      },
+      "permissions.default.desktop-notification": {
+        "Value": 2,
+        "Status": "locked"
+      },
+      "permissions.default.geo": {
+        "Value": 2,
+        "Status": "locked"
+      },
+      "permissions.default.microphone": {
+        "Value": 2,
+        "Status": "locked"
+      },
+      "toolkit.telemetry.enabled": {
+        "Value": false,
+        "Status": "locked"
+      }
+    },
+    "SearchEngines": {
+      "Default": "DuckDuckGo"
+    }
+  }
+}

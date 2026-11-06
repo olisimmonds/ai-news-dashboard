@@ -1,15 +1,10 @@
-import { CATEGORIES } from "../lib/categories";
 import { formatStoryCount } from "../lib/format";
-import type { CategoryId, SortOrder, SourceInfo } from "../lib/types";
+import type { SortOrder, SourceInfo } from "../lib/types";
 import { ChevronDown, Search, X } from "./icons";
 
 interface FilterBarProps {
   searchValue: string;
   onSearchChange: (value: string) => void;
-  category?: CategoryId;
-  showCategoryFilter: boolean;
-  onCategoryChange: (value: CategoryId | undefined) => void;
-  categoryCounts?: Partial<Record<CategoryId, number>>;
   source: string;
   onSourceChange: (value: string) => void;
   sources: SourceInfo[];
@@ -25,10 +20,6 @@ interface FilterBarProps {
 export function FilterBar({
   searchValue,
   onSearchChange,
-  category,
-  showCategoryFilter,
-  onCategoryChange,
-  categoryCounts,
   source,
   onSourceChange,
   sources,
@@ -96,33 +87,6 @@ export function FilterBar({
           </label>
         </div>
       </div>
-
-      {showCategoryFilter ? (
-        <div className="filter-chips" role="group" aria-label="Filter by category">
-          <button
-            type="button"
-            className={`filter-chip${!category ? " is-active" : ""}`}
-            onClick={() => onCategoryChange(undefined)}
-            aria-pressed={!category}
-          >
-            All desks
-          </button>
-          {CATEGORIES.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              className={`filter-chip${category === item.id ? " is-active" : ""} filter-chip-${item.id}`}
-              onClick={() => onCategoryChange(item.id)}
-              aria-pressed={category === item.id}
-            >
-              {item.label}
-              {categoryCounts?.[item.id] !== undefined ? (
-                <span className="chip-count">{categoryCounts[item.id]}</span>
-              ) : null}
-            </button>
-          ))}
-        </div>
-      ) : null}
 
       <div className="filter-status">
         <span aria-live="polite">{loading ? "Updating the feed…" : formatStoryCount(total)}</span>

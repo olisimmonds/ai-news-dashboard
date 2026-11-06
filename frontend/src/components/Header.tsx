@@ -9,7 +9,7 @@ const NAV_ITEMS = [
   { to: "/category/markets-energy", label: "Markets & Energy" },
   { to: "/category/ai-technology", label: "AI & Technology" },
   { to: "/category/general", label: "General News" },
-  { to: "/news", label: "All News" },
+  { to: "/browser", label: "Private Browser" },
 ];
 
 function navClass({ isActive }: { isActive: boolean }): string {

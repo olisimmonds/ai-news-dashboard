@@ -21,7 +21,7 @@ export function Footer({ articleCount, sourceCount, refreshMinutes }: FooterProp
         </div>
         <div className="footer-links">
           <Link to="/">Briefing</Link>
-          <Link to="/news">All news</Link>
+          <Link to="/browser">Private browser</Link>
           <a
             href="https://github.com/olisimmonds/ai-news-dashboard"
             target="_blank"

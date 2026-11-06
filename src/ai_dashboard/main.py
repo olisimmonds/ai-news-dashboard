@@ -15,6 +15,11 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from .api import register_exception_handlers, router
+from .browser.api import register_browser_exception_handlers
+from .browser.api import router as browser_router
+from .browser.auth import BrowserAuth
+from .browser.sessions import BrowserRuntime, BrowserSessionManager, DockerRuntime
+from .browser.store import BrowserStore
 from .config import Settings, get_settings
 from .db import initialise
 from .ingestion import IngestionService, RefreshScheduler
@@ -55,6 +60,7 @@ def create_app(
     *,
     transport: httpx.AsyncBaseTransport | None = None,
     weather_transport: httpx.AsyncBaseTransport | None = None,
+    browser_runtime: BrowserRuntime | None = None,
 ) -> FastAPI:
     settings = settings or get_settings()
     all_sources = list(sources) if sources is not None else load_sources(settings.sources_file)
@@ -62,6 +68,9 @@ def create_app(
     ingestion = IngestionService(repository, settings, all_sources, transport=transport)
     scheduler = RefreshScheduler(ingestion, settings.refresh_interval_minutes)
     weather = WeatherService(settings, transport=weather_transport)
+    browser_auth = BrowserAuth(settings)
+    browser_store = BrowserStore(settings.browser_state_file)
+    browser_manager = BrowserSessionManager(settings, browser_runtime or DockerRuntime(settings))
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -80,9 +89,11 @@ def create_app(
         )
         if settings.scheduler_enabled:
             await scheduler.start()
+        await browser_manager.start()
         try:
             yield
         finally:
+            await browser_manager.stop()
             await scheduler.stop()
             pending = list(app.state.background_tasks)
             for task in pending:
@@ -102,18 +113,23 @@ def create_app(
     app.state.ingestion = ingestion
     app.state.scheduler = scheduler
     app.state.weather = weather
+    app.state.browser_auth = browser_auth
+    app.state.browser_store = browser_store
+    app.state.browser_manager = browser_manager
     app.state.background_tasks = set()
 
     if settings.allowed_origins:
         app.add_middleware(
             CORSMiddleware,
             allow_origins=settings.allowed_origins,
-            allow_methods=["GET", "POST"],
+            allow_methods=["GET", "POST", "PUT", "DELETE"],
             allow_headers=["*"],
         )
 
     register_exception_handlers(app)
+    register_browser_exception_handlers(app)
     app.include_router(router)
+    app.include_router(browser_router)
 
     static_dir = settings.static_dir
     if static_dir.exists() and (static_dir / "assets").exists():

@@ -9,9 +9,6 @@ import { FilterBar } from "./FilterBar";
 const defaultProps = {
   searchValue: "",
   onSearchChange: vi.fn(),
-  showCategoryFilter: true,
-  onCategoryChange: vi.fn(),
-  categoryCounts: { "markets-energy": 12, "ai-technology": 18, general: 12 },
   source: "",
   onSourceChange: vi.fn(),
   sources,
@@ -50,16 +47,6 @@ describe("FilterBar", () => {
     expect(onSearchChange.mock.calls.at(-1)?.[0]).toBe("energy");
   });
 
-  it("switches category when a chip is pressed", async () => {
-    const user = userEvent.setup();
-    const onCategoryChange = vi.fn();
-    render(<FilterBar {...defaultProps} onCategoryChange={onCategoryChange} />);
-
-    await user.click(screen.getByRole("button", { name: /AI & Technology/i }));
-
-    expect(onCategoryChange).toHaveBeenCalledWith("ai-technology");
-  });
-
   it("lists only enabled sources and reports selection", async () => {
     const user = userEvent.setup();
     const onSourceChange = vi.fn();
@@ -82,10 +69,5 @@ describe("FilterBar", () => {
     rerender(<FilterBar {...defaultProps} hasFilters onClear={onClear} />);
     await user.click(screen.getByRole("button", { name: /Clear filters/i }));
     expect(onClear).toHaveBeenCalled();
-  });
-
-  it("hides category chips on a fixed desk page", () => {
-    render(<FilterBar {...defaultProps} showCategoryFilter={false} />);
-    expect(screen.queryByRole("group", { name: /Filter by category/i })).not.toBeInTheDocument();
   });
 });

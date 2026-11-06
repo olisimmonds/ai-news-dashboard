@@ -135,3 +135,31 @@ export interface ArticleQuery {
   offset?: number;
   ids?: number[];
 }
+
+export interface BrowserSession {
+  id: string;
+  created_at: string;
+  last_activity_at: string;
+  idle_timeout_minutes: number;
+  vnc_url: string;
+}
+
+export interface BrowserStatus {
+  enabled: boolean;
+  authenticated: boolean;
+  user: string | null;
+  accounts_configured: boolean;
+  docker_available: boolean;
+  setup_message: string | null;
+  max_sessions: number;
+  active_sessions: number;
+  idle_timeout_minutes: number;
+  session: BrowserSession | null;
+}
+
+export interface BrowserFavourite {
+  title: string;
+  url: string;
+}
+
+export type BrowserAction = "back" | "forward" | "reload" | "new-tab";

@@ -8,13 +8,23 @@ import { MetaProvider } from "./context/MetaProvider";
 import { ReadingProvider } from "./context/ReadingProvider";
 import { ThemeProvider } from "./context/ThemeProvider";
 import * as api from "./lib/api";
-import { briefing, makeArticle, meta } from "./test/fixtures";
+import { briefing, browserFavourites, makeArticle, makeBrowserStatus, meta } from "./test/fixtures";
 
 vi.mock("./lib/api", () => ({
+  browserSessionAction: vi.fn(),
+  closeBrowserSession: vi.fn(),
   getArticles: vi.fn(),
   getBriefing: vi.fn(),
+  getBrowserFavourites: vi.fn(),
+  getBrowserStatus: vi.fn(),
   getMeta: vi.fn(),
   getWeather: vi.fn(),
+  loginBrowser: vi.fn(),
+  logoutBrowser: vi.fn(),
+  navigateBrowserSession: vi.fn(),
+  restartBrowserSession: vi.fn(),
+  saveBrowserFavourites: vi.fn(),
+  startBrowserSession: vi.fn(),
   triggerRefresh: vi.fn(),
 }));
 
@@ -40,6 +50,8 @@ beforeEach(() => {
   mocked.getMeta.mockResolvedValue(meta);
   mocked.getBriefing.mockResolvedValue(briefing);
   mocked.getWeather.mockResolvedValue({ locations: [], generated_at: new Date().toISOString() });
+  mocked.getBrowserStatus.mockResolvedValue(makeBrowserStatus());
+  mocked.getBrowserFavourites.mockResolvedValue(browserFavourites);
   mocked.getArticles.mockResolvedValue({
     items: [makeArticle({ id: 3, title: "A feed article" })],
     total: 1,
@@ -69,18 +81,18 @@ describe("App", () => {
     expect(screen.getByRole("dialog", { name: "Search news" })).toBeVisible();
 
     await user.type(screen.getByRole("searchbox"), "feed");
-    expect(await screen.findByRole("link", { name: /A feed article/i })).toBeVisible();
+    expect(
+      await screen.findByRole("link", { name: /A feed article/i }, { timeout: 3000 }),
+    ).toBeVisible();
   });
 
-  it("loads the all-news feed", async () => {
-    renderApp(["/news"]);
+  it("opens the private browser and asks for sign-in", async () => {
+    renderApp(["/browser"]);
 
-    expect(await screen.findByRole("heading", { level: 1, name: "All News" })).toBeVisible();
-    expect(await screen.findByText("A feed article")).toBeVisible();
-    expect(mocked.getArticles).toHaveBeenCalledWith(
-      expect.objectContaining({ sort: "newest", limit: 30, offset: 0 }),
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    );
+    expect(
+      await screen.findByRole("heading", { level: 2, name: "Sign in to the browser" }),
+    ).toBeVisible();
+    expect(screen.queryByRole("link", { name: "All News" })).not.toBeInTheDocument();
   });
 
   it("shows the not-found page for an unknown route", async () => {

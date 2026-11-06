@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { useNavigate } from "react-router-dom";
 
 import { useDebouncedValue } from "../hooks/useDebouncedValue";
 import { useReading } from "../hooks/useReading";
@@ -15,13 +14,11 @@ interface SearchDialogProps {
 }
 
 export function SearchDialog({ open, onClose }: SearchDialogProps) {
-  const navigate = useNavigate();
   const { markRead } = useReading();
   const inputRef = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState("");
   const debounced = useDebouncedValue(query, 250);
   const [results, setResults] = useState<Article[]>([]);
-  const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -29,7 +26,6 @@ export function SearchDialog({ open, onClose }: SearchDialogProps) {
     if (!open) return;
     setQuery("");
     setResults([]);
-    setTotal(0);
     setError(null);
     const focusTimer = window.setTimeout(() => inputRef.current?.focus(), 20);
     const previousOverflow = document.body.style.overflow;
@@ -53,7 +49,6 @@ export function SearchDialog({ open, onClose }: SearchDialogProps) {
     const term = debounced.trim();
     if (!open || term.length < 2) {
       setResults([]);
-      setTotal(0);
       setLoading(false);
       setError(null);
       return;
@@ -66,7 +61,6 @@ export function SearchDialog({ open, onClose }: SearchDialogProps) {
       .then((page) => {
         if (controller.signal.aborted) return;
         setResults(page.items);
-        setTotal(page.total);
       })
       .catch((cause: unknown) => {
         if (controller.signal.aborted) return;
@@ -86,9 +80,6 @@ export function SearchDialog({ open, onClose }: SearchDialogProps) {
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!term) return;
-    navigate(`/news?q=${encodeURIComponent(term)}`);
-    onClose();
   }
 
   return (
@@ -166,16 +157,6 @@ export function SearchDialog({ open, onClose }: SearchDialogProps) {
                   </a>
                 ))}
               </div>
-              <button
-                type="button"
-                className="search-all"
-                onClick={() => {
-                  navigate(`/news?q=${encodeURIComponent(term)}`);
-                  onClose();
-                }}
-              >
-                See all {total} matching {total === 1 ? "story" : "stories"}
-              </button>
             </>
           ) : null}
         </div>

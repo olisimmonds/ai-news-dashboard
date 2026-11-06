@@ -1,4 +1,14 @@
-import type { ArticleList, ArticleQuery, Briefing, Meta, Weather } from "./types";
+import type {
+  ArticleList,
+  ArticleQuery,
+  Briefing,
+  BrowserAction,
+  BrowserFavourite,
+  BrowserSession,
+  BrowserStatus,
+  Meta,
+  Weather,
+} from "./types";
 
 const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? "";
 
@@ -16,6 +26,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
     response = await fetch(`${API_BASE}${path}`, {
+      credentials: "same-origin",
       headers: { Accept: "application/json" },
       ...init,
     });
@@ -78,5 +89,76 @@ export function getWeather(init?: { signal?: AbortSignal }): Promise<Weather> {
 export function triggerRefresh(): Promise<{ status: string; message: string }> {
   return request<{ status: string; message: string }>("/api/refresh", {
     method: "POST",
+  });
+}
+
+export function getBrowserStatus(init?: { signal?: AbortSignal }): Promise<BrowserStatus> {
+  return request<BrowserStatus>("/api/browser/status", { signal: init?.signal });
+}
+
+export function loginBrowser(username: string, password: string): Promise<{ user: string }> {
+  return request<{ user: string }>("/api/browser/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+}
+
+export function logoutBrowser(): Promise<{ status: string }> {
+  return request<{ status: string }>("/api/browser/auth/logout", { method: "POST" });
+}
+
+export function getBrowserFavourites(init?: { signal?: AbortSignal }): Promise<BrowserFavourite[]> {
+  return request<BrowserFavourite[]>("/api/browser/favourites", { signal: init?.signal });
+}
+
+export function saveBrowserFavourites(favourites: BrowserFavourite[]): Promise<BrowserFavourite[]> {
+  return request<BrowserFavourite[]>("/api/browser/favourites", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ favourites }),
+  });
+}
+
+export function startBrowserSession(url?: string): Promise<BrowserSession> {
+  return request<BrowserSession>("/api/browser/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url: url || null }),
+  });
+}
+
+export function navigateBrowserSession(
+  sessionId: string,
+  url: string,
+  newTab = false,
+): Promise<BrowserSession> {
+  return request<BrowserSession>(`/api/browser/sessions/${sessionId}/navigate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url, new_tab: newTab }),
+  });
+}
+
+export function browserSessionAction(
+  sessionId: string,
+  action: BrowserAction,
+): Promise<BrowserSession> {
+  return request<BrowserSession>(`/api/browser/sessions/${sessionId}/action`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action }),
+  });
+}
+
+export function restartBrowserSession(sessionId: string): Promise<BrowserSession> {
+  return request<BrowserSession>(`/api/browser/sessions/${sessionId}/restart`, {
+    method: "POST",
+  });
+}
+
+export function closeBrowserSession(sessionId: string): Promise<{ status: string }> {
+  return request<{ status: string }>(`/api/browser/sessions/${sessionId}`, {
+    method: "DELETE",
   });
 }
