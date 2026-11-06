@@ -403,13 +403,6 @@ export function BrowserPage() {
   if (!status.authenticated) {
     return (
       <div className="page browser-page">
-        <header className="page-header browser-header">
-          <div className="page-eyebrow">Private browser</div>
-          <h1 className="page-title">A quiet window to the wider web</h1>
-          <p className="page-deck">
-            A separate Firefox profile on the Pi, rendered securely to this screen.
-          </p>
-        </header>
         {actionError ? (
           <p className="browser-warning" role="alert">
             {actionError}
@@ -424,35 +417,24 @@ export function BrowserPage() {
 
   return (
     <div className={`page browser-page${session ? " has-session" : ""}`}>
-      <header className="page-header browser-header">
-        <div className="page-eyebrow">Private browser</div>
-        <div className="browser-heading-row">
-          <div>
-            <h1 className="page-title">{session ? "The wider web" : "A quiet window"}</h1>
-            <p className="page-deck">
-              {session
-                ? "Firefox is running on the Pi. Actions here travel over your private network."
-                : "Start a private Firefox session on the Pi, then browse from this phone."}
-            </p>
-          </div>
-          <div className="browser-account">
-            <span>
-              Signed in as <strong>{status.user}</strong>
-            </span>
-            <Link to="/browser/favourites" className="text-link">
-              Favourites
-            </Link>
-            <button
-              type="button"
-              className="text-link"
-              onClick={() => void signOut()}
-              disabled={busyNow}
-            >
-              Sign out
-            </button>
-          </div>
+      <div className="browser-account-bar">
+        <span>
+          Signed in as <strong>{status.user}</strong>
+        </span>
+        <div className="browser-account">
+          <Link to="/browser/favourites" className="text-link">
+            Favourites
+          </Link>
+          <button
+            type="button"
+            className="text-link"
+            onClick={() => void signOut()}
+            disabled={busyNow}
+          >
+            Sign out
+          </button>
         </div>
-      </header>
+      </div>
 
       {actionError ? (
         <p className="browser-warning" role="alert">

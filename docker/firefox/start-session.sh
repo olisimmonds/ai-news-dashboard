@@ -11,16 +11,15 @@ find /home/browser/.mozilla -name lock -delete
 find /home/browser/.mozilla -name .parentlock -delete
 
 Xvnc :1 \
-    -localhost=1 \
-    -rfbport=5901 \
+    -localhost \
+    -rfbport 5901 \
     -geometry 1280x800 \
-    -depth=24 \
-    -SecurityTypes=None \
+    -depth 24 \
+    -SecurityTypes None \
     -AlwaysShared \
     -AcceptKeyEvents \
     -AcceptPointerEvents \
-    -xkb \
-    -nolisten=tcp &
+    -nolisten tcp &
 XVNC_PID=$!
 
 ready=0
@@ -42,7 +41,20 @@ WM_PID=$!
 websockify --web=/usr/share/novnc 6080 127.0.0.1:5901 &
 NOVNC_PID=$!
 
-sleep 1
+ready=0
+for _ in $(seq 1 50); do
+    if curl --fail --silent --show-error --max-time 1 \
+        http://127.0.0.1:6080/vnc_lite.html >/dev/null 2>&1; then
+        ready=1
+        break
+    fi
+    sleep 0.2
+done
+if [ "$ready" -ne 1 ]; then
+    echo "noVNC did not start" >&2
+    exit 1
+fi
+
 firefox-esr --no-remote --name meridian-browser --class MeridianBrowser &
 FIREFOX_PID=$!
 

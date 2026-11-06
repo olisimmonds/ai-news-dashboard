@@ -347,3 +347,18 @@ def test_normalise_target_preserves_http_and_builds_web_targets() -> None:
     assert normalise_target("energy prices") == ("https://duckduckgo.com/?q=energy+prices")
     with pytest.raises(ValueError):
         normalise_target("file:///etc/passwd")
+
+
+def test_container_start_script_uses_valid_x_server_options() -> None:
+    script = (
+        Path(__file__).resolve().parents[1] / "docker" / "firefox" / "start-session.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "-depth 24" in script
+    assert "-geometry 1280x800" in script
+    assert "-nolisten tcp" in script
+    assert "-localhost \\" in script
+    assert "/vnc_lite.html" in script
+
+    for invalid in ("-depth=", "-geometry=", "-nolisten=", "-xkb"):
+        assert invalid not in script

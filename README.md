@@ -150,6 +150,7 @@ sudo usermod -aG docker "$USER"
 
 # 2. Build the ARM64 Firefox image from this repository.
 docker build -t meridian-firefox:latest docker/firefox
+# Rebuild after changing anything under docker/firefox; the startup scripts are copied into the image.
 
 # 3. Install Python dependencies and create a local browser account.
 uv sync
@@ -189,7 +190,14 @@ The image can also be smoke-tested directly; this is for local diagnosis only an
 docker run --rm --shm-size=512m -p 127.0.0.1:6080:6080 meridian-firefox:latest
 ```
 
-Then open <http://127.0.0.1:6080/vnc_lite.html>. Do not expose that port beyond localhost.
+Then open <http://127.0.0.1:6080/vnc_lite.html> and confirm it responds with:
+
+```bash
+curl --fail --silent --show-error --output /dev/null \
+  http://127.0.0.1:6080/vnc_lite.html && echo "noVNC OK"
+```
+
+Do not expose that port beyond localhost. If the container exits at startup, inspect `docker logs` before retrying.
 
 ## Rail disruption
 

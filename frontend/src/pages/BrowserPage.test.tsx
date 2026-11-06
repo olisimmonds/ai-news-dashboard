@@ -62,6 +62,17 @@ describe("BrowserPage", () => {
     expect(await screen.findByText(/Signed in as/i)).toBeVisible();
   });
 
+  it("keeps the idle browser page compact", async () => {
+    mocked.getBrowserStatus.mockResolvedValue(
+      makeBrowserStatus({ authenticated: true, user: "alice" }),
+    );
+    renderPage();
+
+    expect(await screen.findByText("Where would you like to go?")).toBeVisible();
+    expect(screen.queryByText("A quiet window")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Start a private Firefox session/)).not.toBeInTheDocument();
+  });
+
   it("starts a session from a saved favourite", async () => {
     const user = userEvent.setup();
     mocked.getBrowserStatus.mockResolvedValue(
