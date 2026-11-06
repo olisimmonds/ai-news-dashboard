@@ -184,20 +184,25 @@ sudo systemctl enable --now meridian
 6. Leave a session idle until the timeout and confirm the container is removed with `docker ps`.
 7. Close the session and confirm the profile volume remains with `docker volume ls`.
 
-The image can also be smoke-tested directly; this is for local diagnosis only and has no Meridian authentication:
+The image can also be smoke-tested directly; this is for local diagnosis only and has no Meridian authentication. Keep the container after it starts so its logs remain available:
 
 ```bash
-docker run --rm --shm-size=512m -p 127.0.0.1:6080:6080 meridian-firefox:latest
-```
+docker rm -f meridian-firefox-smoke >/dev/null 2>&1 || true
+docker run --detach --name meridian-firefox-smoke --shm-size=512m \
+  -p 127.0.0.1:6080:6080 meridian-firefox:latest
 
-Then open <http://127.0.0.1:6080/vnc_lite.html> and confirm it responds with:
-
-```bash
 curl --fail --silent --show-error --output /dev/null \
   http://127.0.0.1:6080/vnc_lite.html && echo "noVNC OK"
+docker logs --tail 200 --timestamps meridian-firefox-smoke
 ```
 
-Do not expose that port beyond localhost. If the container exits at startup, inspect `docker logs` before retrying.
+Open <http://127.0.0.1:6080/vnc_lite.html> to confirm Firefox is visible. A 200 from noVNC only proves that websockify is serving; it does not prove Firefox started. Meridian also waits for a visible Firefox window and logs the container state plus its last 200 log lines before cleaning up a failed session. On the Pi, check those diagnostics with `journalctl -u meridian -n 200 --no-pager`.
+
+```bash
+docker rm -f meridian-firefox-smoke
+```
+
+Do not expose that port beyond localhost. Rebuild the image after changing anything under `docker/firefox`; the startup scripts are copied into the image.
 
 ## Rail disruption
 

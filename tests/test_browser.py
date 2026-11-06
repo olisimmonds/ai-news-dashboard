@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from pathlib import Path
 
 import pytest
@@ -7,9 +9,12 @@ from fastapi.testclient import TestClient
 
 from ai_dashboard.browser.auth import BrowserAuth, hash_password, save_accounts, verify_password
 from ai_dashboard.browser.sessions import (
+    _WINDOW_SEARCH,
     BrowserLimitReached,
     BrowserSessionManager,
+    BrowserUnavailable,
     ContainerSpec,
+    DockerRuntime,
     normalise_target,
 )
 from ai_dashboard.config import Settings
@@ -170,7 +175,7 @@ def test_browser_requires_auth_and_can_start_a_session(
     assert "view_only" not in payload["vnc_url"]
     assert len(runtime.starts) == 1
     assert len(runtime.commands) == 1
-    assert "meridian-browser" in runtime.commands[0][1]
+    assert "meridian-browser|MeridianBrowser|Firefox" in runtime.commands[0][1]
     assert "https://example.com" in runtime.commands[0][1]
 
 
@@ -362,3 +367,58 @@ def test_container_start_script_uses_valid_x_server_options() -> None:
 
     for invalid in ("-depth=", "-geometry=", "-nolisten=", "-xkb"):
         assert invalid not in script
+
+
+def test_window_search_uses_one_xdotool_pattern() -> None:
+    assert _WINDOW_SEARCH[-1] == "meridian-browser|MeridianBrowser|Firefox"
+    assert "--class" not in _WINDOW_SEARCH
+    assert "--classname" not in _WINDOW_SEARCH
+
+
+def test_docker_start_reports_diagnostics_before_cleanup(
+    browser_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runtime = DockerRuntime(browser_settings)
+    events: list[str] = []
+    run_calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*args: str, timeout: float = 20.0, check: bool = True) -> str:
+        events.append(f"run:{args[0]}")
+        run_calls.append(args)
+        if args[0] == "port":
+            return "127.0.0.1:32770"
+        return ""
+
+    async def fake_diagnostics(name: str) -> str:
+        events.append("diagnostics")
+        return "state: exited\nlogs:\nFirefox failed to start"
+
+    async def fake_wait_ready(name: str, port: int) -> None:
+        events.append("wait_ready")
+        raise BrowserUnavailable("The browser window did not start in time.")
+
+    monkeypatch.setattr(runtime, "_run", fake_run)
+    monkeypatch.setattr(runtime, "_diagnostics", fake_diagnostics)
+    monkeypatch.setattr(runtime, "wait_ready", fake_wait_ready)
+
+    spec = ContainerSpec(
+        name="meridian-browser-test",
+        image="meridian-firefox:test",
+        volume="meridian-browser-home-test",
+        network="meridian-browser-test",
+        novnc_port=6080,
+        memory="900m",
+        cpus="1.5",
+    )
+
+    with caplog.at_level(logging.ERROR), pytest.raises(BrowserUnavailable, match="window"):
+        asyncio.run(runtime.start(spec))
+
+    run_args = next(call for call in run_calls if call[0] == "run")
+    assert "--rm" not in run_args
+
+    cleanup_index = max(index for index, event in enumerate(events) if event == "run:rm")
+    assert events.index("diagnostics") < cleanup_index
+    assert "Firefox failed to start" in caplog.text

@@ -2,7 +2,8 @@ FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/home/browser \
-    DISPLAY=:1
+    DISPLAY=:1 \
+    XAUTHORITY=/home/browser/.Xauthority
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \

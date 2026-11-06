@@ -17,7 +17,7 @@ from ai_dashboard.parsing import canonicalise_url, dedupe_key
 from ai_dashboard.repository import Repository
 from ai_dashboard.sources import SourceConfig
 
-NOW = datetime(2026, 11, 3, 12, 0, tzinfo=UTC)
+NOW = datetime.now(UTC).replace(microsecond=0)
 
 
 @pytest.fixture

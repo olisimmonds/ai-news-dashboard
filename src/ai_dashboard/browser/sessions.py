@@ -22,12 +22,10 @@ _WINDOW_SEARCH = (
     "--onlyvisible",
     "--limit",
     "1",
-    "--any",
-    "--classname",
-    "meridian-browser",
-    "--class",
-    ".*[Ff]irefox.*",
+    "meridian-browser|MeridianBrowser|Firefox",
 )
+_BROWSER_UID = "1000"
+_BROWSER_XAUTHORITY = "/home/browser/.Xauthority"
 
 
 class BrowserError(RuntimeError):
@@ -82,7 +80,7 @@ class DockerRuntime:
         self._available: bool | None = None
         self._checked_at = 0.0
 
-    async def _run(self, *args: str, timeout: float = 20.0, check: bool = True) -> str:
+    async def _execute(self, *args: str, timeout: float = 20.0) -> tuple[str, str, int]:
         try:
             process = await asyncio.create_subprocess_exec(
                 self._binary,
@@ -102,10 +100,19 @@ class DockerRuntime:
             await process.wait()
             raise BrowserUnavailable("Docker did not respond in time.") from exc
 
-        if check and process.returncode != 0:
-            message = stderr.decode(errors="replace").strip()
-            raise BrowserError(message or f"Docker command failed: {' '.join(args[:2])}")
-        return stdout.decode(errors="replace").strip()
+        returncode = process.returncode
+        assert returncode is not None
+        return (
+            stdout.decode(errors="replace").strip(),
+            stderr.decode(errors="replace").strip(),
+            returncode,
+        )
+
+    async def _run(self, *args: str, timeout: float = 20.0, check: bool = True) -> str:
+        stdout, stderr, returncode = await self._execute(*args, timeout=timeout)
+        if check and returncode != 0:
+            raise BrowserError(stderr or f"Docker command failed: {' '.join(args[:2])}")
+        return stdout
 
     async def available(self) -> bool:
         now = time.monotonic()
@@ -136,92 +143,130 @@ class DockerRuntime:
         await self._ensure_network()
         await self._run("volume", "create", spec.volume, timeout=20)
         await self.remove(spec.name)
-        await self._run(
-            "run",
-            "--detach",
-            "--rm",
-            "--init",
-            "--name",
-            spec.name,
-            "--label",
-            "meridian.browser.session=1",
-            "--network",
-            spec.network,
-            "--security-opt",
-            "no-new-privileges=true",
-            "--cap-drop",
-            "ALL",
-            "--cap-add",
-            "CHOWN",
-            "--cap-add",
-            "DAC_OVERRIDE",
-            "--cap-add",
-            "SETUID",
-            "--cap-add",
-            "SETGID",
-            "--pids-limit",
-            "256",
-            "--memory",
-            spec.memory,
-            "--cpus",
-            spec.cpus,
-            "--shm-size",
-            "512m",
-            "--publish",
-            f"127.0.0.1::{spec.novnc_port}",
-            "--volume",
-            f"{spec.volume}:/home/browser",
-            spec.image,
-            timeout=90,
-        )
         try:
+            await self._run(
+                "run",
+                "--detach",
+                "--init",
+                "--name",
+                spec.name,
+                "--label",
+                "meridian.browser.session=1",
+                "--network",
+                spec.network,
+                "--security-opt",
+                "no-new-privileges=true",
+                "--cap-drop",
+                "ALL",
+                "--cap-add",
+                "CHOWN",
+                "--cap-add",
+                "DAC_OVERRIDE",
+                "--cap-add",
+                "SETUID",
+                "--cap-add",
+                "SETGID",
+                "--pids-limit",
+                "256",
+                "--memory",
+                spec.memory,
+                "--cpus",
+                spec.cpus,
+                "--shm-size",
+                "512m",
+                "--publish",
+                f"127.0.0.1::{spec.novnc_port}",
+                "--volume",
+                f"{spec.volume}:/home/browser",
+                spec.image,
+                timeout=90,
+            )
             mapping = await self._run("port", spec.name, f"{spec.novnc_port}/tcp", timeout=10)
             line = mapping.splitlines()[-1]
             port = int(line.rsplit(":", 1)[-1])
-        except (IndexError, ValueError) as exc:
-            await self.remove(spec.name)
-            raise BrowserError("Could not determine the browser container port.") from exc
-
-        try:
             await self.wait_ready(spec.name, port)
-        except BrowserUnavailable:
-            await self.remove(spec.name)
-            raise
+        except (BrowserError, IndexError, ValueError) as exc:
+            await self._report_start_failure(spec.name, exc)
+            try:
+                await self.remove(spec.name)
+            except BrowserError:
+                logger.exception("Could not remove failed browser container %s", spec.name)
+            if isinstance(exc, BrowserUnavailable):
+                raise
+            raise BrowserUnavailable(str(exc)) from exc
         return port
 
-    async def wait_ready(self, name: str, port: int, timeout: float = 30.0) -> None:
-        deadline = time.monotonic() + timeout
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            while time.monotonic() < deadline:
-                try:
-                    response = await client.get(f"http://127.0.0.1:{port}/vnc_lite.html")
-                    if response.status_code == 200:
-                        break
-                except httpx.HTTPError:
-                    pass
-                await asyncio.sleep(0.5)
-            else:
-                raise BrowserUnavailable("The browser display did not start in time.")
+    async def _diagnostics(self, name: str) -> str:
+        try:
+            state, state_error, state_code = await self._execute(
+                "inspect",
+                "--format",
+                (
+                    "status={{.State.Status}} running={{.State.Running}} "
+                    "exit={{.State.ExitCode}} error={{.State.Error}}"
+                ),
+                name,
+                timeout=10,
+            )
+            if state_code != 0:
+                state = state_error or state or f"docker inspect exited {state_code}"
+        except BrowserUnavailable as exc:
+            state = str(exc)
 
         try:
-            await self._run(
-                "exec",
-                name,
-                "xdotool",
-                "search",
-                "--sync",
-                "--onlyvisible",
-                "--limit",
-                "1",
-                "--any",
-                "--classname",
-                "meridian-browser",
-                "--class",
-                ".*[Ff]irefox.*",
-                timeout=30,
+            logs, logs_error, _logs_code = await self._execute(
+                "logs", "--tail", "200", "--timestamps", name, timeout=10
             )
-        except BrowserError as exc:
-            raise BrowserUnavailable("The browser window did not start in time.") from exc
+            logs = "\n".join(part for part in (logs, logs_error) if part) or "(no logs)"
+        except BrowserUnavailable as exc:
+            logs = str(exc)
+
+        return f"state: {state}\nlogs:\n{logs}"
+
+    async def _report_start_failure(self, name: str, error: Exception) -> None:
+        try:
+            diagnostics = await self._diagnostics(name)
+        except Exception:
+            logger.exception("Could not collect diagnostics for browser container %s", name)
+            diagnostics = "diagnostics unavailable"
+        logger.error("Browser container %s failed during startup: %s\n%s", name, error, diagnostics)
+
+    async def wait_ready(self, name: str, port: int, timeout: float = 45.0) -> None:
+        deadline = time.monotonic() + timeout
+        display_ready = False
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            while time.monotonic() < deadline:
+                if not display_ready:
+                    try:
+                        response = await client.get(f"http://127.0.0.1:{port}/vnc_lite.html")
+                        display_ready = response.status_code == 200
+                    except httpx.HTTPError:
+                        pass
+
+                if display_ready:
+                    try:
+                        await self._run(
+                            "exec",
+                            "--user",
+                            _BROWSER_UID,
+                            "--env",
+                            f"XAUTHORITY={_BROWSER_XAUTHORITY}",
+                            name,
+                            "xdotool",
+                            *_WINDOW_SEARCH,
+                            timeout=5,
+                        )
+                        return
+                    except BrowserError:
+                        pass
+
+                if not await self.is_running(name):
+                    raise BrowserUnavailable("The browser container exited during startup.")
+                await asyncio.sleep(0.5)
+
+        if not display_ready:
+            raise BrowserUnavailable("The browser display did not start in time.")
+        raise BrowserUnavailable("The browser window did not start in time.")
 
     async def remove(self, name: str) -> None:
         await self._run("rm", "--force", name, timeout=20, check=False)
@@ -239,7 +284,16 @@ class DockerRuntime:
             return False
 
     async def run_command(self, name: str, args: list[str]) -> None:
-        await self._run("exec", name, *args, timeout=15)
+        await self._run(
+            "exec",
+            "--user",
+            _BROWSER_UID,
+            "--env",
+            f"XAUTHORITY={_BROWSER_XAUTHORITY}",
+            name,
+            *args,
+            timeout=15,
+        )
 
     async def cleanup_orphans(self) -> None:
         output = await self._run(
