@@ -80,8 +80,20 @@
         "Value": 0,
         "Status": "locked"
       },
+      "browser.sessionstore.resume_from_crash": {
+        "Value": false,
+        "Status": "locked"
+      },
+      "browser.tabs.unloadOnLowMemory": {
+        "Value": true,
+        "Status": "locked"
+      },
       "datareporting.policy.dataSubmissionEnabled": {
         "Value": false,
+        "Status": "locked"
+      },
+      "dom.ipc.processCount": {
+        "Value": 2,
         "Status": "locked"
       },
       "permissions.default.camera": {

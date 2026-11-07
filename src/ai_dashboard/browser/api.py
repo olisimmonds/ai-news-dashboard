@@ -15,7 +15,7 @@ from fastapi import APIRouter, FastAPI, HTTPException, Request, Response, WebSoc
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 from starlette.websockets import WebSocketDisconnect
-from websockets.asyncio.client import connect
+from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
 
 from ai_dashboard.config import Settings
@@ -36,6 +36,9 @@ from .store import BrowserStore, Favourite
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/browser", tags=["private-browser"])
+
+_DISPLAY_CONNECT_TIMEOUT_SECONDS = 5.0
+_DISPLAY_RETRY_DELAY_SECONDS = 0.5
 
 BrowserAction = Literal["back", "forward", "reload", "new-tab"]
 
@@ -185,6 +188,11 @@ def _require_same_origin(request: Request) -> None:
 def _vnc_url(session: BrowserSession) -> str:
     websocket_path = quote(f"api/browser/sessions/{session.id}/websockify", safe="")
     return f"/api/browser/sessions/{session.id}/vnc/vnc_lite.html?scale=true&path={websocket_path}"
+
+
+async def _fetch_display_asset(port: int, path: str) -> httpx.Response:
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
+        return await client.get(f"http://127.0.0.1:{port}{path}")
 
 
 def _session_out(session: BrowserSession, settings: Settings) -> BrowserSessionOut:
@@ -365,16 +373,50 @@ async def vnc_asset(request: Request, session_id: str, asset_path: str) -> Respo
     if request.url.query:
         path = f"{path}?{request.url.query}"
     try:
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
-            upstream = await client.get(f"http://127.0.0.1:{session.port}{path}")
-    except httpx.HTTPError as exc:
-        raise BrowserUnavailable("The browser display is not responding.") from exc
+        upstream = await _fetch_display_asset(session.port, path)
+    except httpx.HTTPError as first_error:
+        logger.warning(
+            "Display asset request failed for %s on port %s: %s",
+            session.container,
+            session.port,
+            first_error,
+        )
+        await asyncio.sleep(_DISPLAY_RETRY_DELAY_SECONDS)
+        try:
+            upstream = await _fetch_display_asset(session.port, path)
+        except httpx.HTTPError:
+            try:
+                session = await manager.recover_display(
+                    session_id, user, reason=f"noVNC asset proxy failed: {path}"
+                )
+                upstream = await _fetch_display_asset(session.port, path)
+            except BrowserError as exc:
+                logger.error("Could not recover browser display for %s: %s", session.container, exc)
+                raise BrowserUnavailable("The browser display is not responding.") from exc
+            except httpx.HTTPError as retry_error:
+                await manager.report_display_failure(
+                    session_id,
+                    user,
+                    reason=f"noVNC asset proxy still failed after recovery: {retry_error}",
+                )
+                raise BrowserUnavailable("The browser display is not responding.") from retry_error
     headers = {
         key: value
         for key, value in upstream.headers.items()
         if key.lower() in {"content-type", "cache-control", "pragma", "expires"}
     }
     return Response(content=upstream.content, status_code=upstream.status_code, headers=headers)
+
+
+async def _connect_upstream(session: BrowserSession, websocket: WebSocket) -> ClientConnection:
+    return await connect(
+        f"ws://127.0.0.1:{session.port}/websockify",
+        subprotocols=websocket.scope.get("subprotocols") or None,
+        max_size=None,
+        ping_interval=20,
+        ping_timeout=20,
+        open_timeout=_DISPLAY_CONNECT_TIMEOUT_SECONDS,
+    )
 
 
 @router.websocket("/sessions/{session_id}/websockify")
@@ -399,16 +441,35 @@ async def websockify(websocket: WebSocket, session_id: str) -> None:
         return
 
     try:
-        upstream = await connect(
-            f"ws://127.0.0.1:{session.port}/websockify",
-            subprotocols=websocket.scope.get("subprotocols") or None,
-            max_size=None,
-            ping_interval=20,
-            ping_timeout=20,
+        upstream = await _connect_upstream(session, websocket)
+    except Exception as first_error:
+        logger.warning(
+            "WebSocket display connection failed for %s on port %s: %s",
+            session.container,
+            session.port,
+            first_error,
         )
-    except Exception:
-        await websocket.close(code=1011)
-        return
+        await asyncio.sleep(_DISPLAY_RETRY_DELAY_SECONDS)
+        try:
+            upstream = await _connect_upstream(session, websocket)
+        except Exception:
+            try:
+                session = await manager.recover_display(
+                    session_id, user, reason="noVNC WebSocket proxy connection failed"
+                )
+                upstream = await _connect_upstream(session, websocket)
+            except BrowserError as exc:
+                logger.error("Could not recover browser display for %s: %s", session.container, exc)
+                await websocket.close(code=1011)
+                return
+            except Exception as exc:
+                await manager.report_display_failure(
+                    session_id,
+                    user,
+                    reason=f"noVNC WebSocket proxy still failed after recovery: {exc}",
+                )
+                await websocket.close(code=1011)
+                return
 
     await websocket.accept(subprotocol=upstream.subprotocol)
 

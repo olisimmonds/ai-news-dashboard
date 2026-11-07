@@ -75,7 +75,7 @@ class Settings(BaseSettings):
     browser_container_prefix: str = "meridian-browser"
     browser_home_volume_prefix: str = "meridian-browser-home"
     browser_novnc_port: int = Field(default=6080, ge=1024, le=65535)
-    browser_memory_limit: str = "900m"
+    browser_memory_limit: str = "1200m"
     browser_cpus: str = "1.5"
     browser_docker_binary: str = "docker"
 

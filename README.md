@@ -80,7 +80,7 @@ Settings use the `AI_DASHBOARD_` environment prefix and can also be placed in a 
 | `AI_DASHBOARD_BROWSER_IDLE_TIMEOUT_MINUTES` | `20` | Idle session shutdown |
 | `AI_DASHBOARD_BROWSER_MAX_SESSIONS` | `2` | Global concurrent Firefox containers |
 | `AI_DASHBOARD_BROWSER_IMAGE` | `meridian-firefox:latest` | Browser container image |
-| `AI_DASHBOARD_BROWSER_MEMORY_LIMIT` | `900m` | Memory limit per Firefox container |
+| `AI_DASHBOARD_BROWSER_MEMORY_LIMIT` | `1200m` | Memory limit per Firefox container |
 | `AI_DASHBOARD_BROWSER_CPUS` | `1.5` | CPU limit per Firefox container |
 | `AI_DASHBOARD_BROWSER_COOKIE_NAME` | `meridian_browser` | Authentication cookie name |
 | `AI_DASHBOARD_SCHEDULER_ENABLED` | `true` | Enable background refresh |
@@ -127,6 +127,9 @@ The private browser is deliberately separate from the news database. A phone ope
 - Browser accounts use scrypt password hashes. Sessions use signed, HttpOnly cookies and are closed on sign-out.
 - Idle sessions are reaped after `AI_DASHBOARD_BROWSER_IDLE_TIMEOUT_MINUTES`; at most `AI_DASHBOARD_BROWSER_MAX_SESSIONS` containers run at once.
 - Firefox force-installs uBlock Origin, blocks popups, enables tracking protection, disables telemetry, password storage and app updates.
+- Firefox is capped at two content processes and is configured not to restore tabs after a crash, reducing memory pressure on the Pi.
+- The container has a Docker health check for Xvnc, websockify and Firefox. The startup supervisor restarts a dead or unresponsive websockify/openbox process and exits the container if Xvnc or Firefox disappears.
+- Meridian retries a failed display request, then restarts the container in place when the display is genuinely stale. The named profile volume is retained.
 - There is no phone-side file transfer, host folder mount or clipboard permission granted to the embedded display. Downloads remain inside the user's browser volume.
 
 ### Limitations
@@ -136,7 +139,7 @@ The private browser is deliberately separate from the news database. A phone ope
 - Access to the Docker socket is effectively root-equivalent on the Pi. Only the Meridian service account should hold that permission.
 - A local process on the Pi that can reach loopback can connect to a running container's random VNC port and bypass Meridian's login. Treat shell access to the Pi as trusted.
 - Remote rendering is functional, not native. Video, audio, high-DPI scrolling and some keyboard shortcuts may behave differently from a local browser.
-- Each Firefox container defaults to 900 MB and 1.5 CPUs. Two sessions plus Meridian and the operating system fit a 4 GB Pi 4, but leave little headroom.
+- Each Firefox container defaults to 1.2 GB and 1.5 CPUs. Two sessions plus Meridian and the operating system fit a 4 GB Pi 4, but leave little headroom. If `AI_DASHBOARD_BROWSER_MEMORY_LIMIT` is explicitly set in `.env`, that value overrides the default.
 - Browser profiles persist in named Docker volumes. Delete the relevant `meridian-browser-home-*` volume to reset a profile.
 
 ### Install on the Raspberry Pi
@@ -197,6 +200,28 @@ docker logs --tail 200 --timestamps meridian-firefox-smoke
 ```
 
 Open <http://127.0.0.1:6080/vnc_lite.html> to confirm Firefox is visible. A 200 from noVNC only proves that websockify is serving; it does not prove Firefox started. Meridian also waits for a visible Firefox window and logs the container state plus its last 200 log lines before cleaning up a failed session. On the Pi, check those diagnostics with `journalctl -u meridian -n 200 --no-pager`.
+
+### Display disconnects
+
+`The browser display is not responding` is Meridian's proxy error: the container's noVNC/websockify endpoint did not answer. It does not by itself prove Firefox crashed. A browser that still accepts navigation but cannot serve noVNC usually has a dead or wedged websockify process; a container that has disappeared or was OOM-killed also produces the same panel.
+
+Meridian now logs the Docker state, OOM flag, health status, memory/CPU usage, process list and the last 200 container log lines when the display fails. It also retries the request and restarts the container in place if the display does not recover. The profile volume is preserved.
+
+Inspect the exact failure on the Pi with:
+
+```bash
+journalctl -u meridian -n 300 --no-pager
+docker ps -a --filter label=meridian.browser.session=1 \
+  --format 'name={{.Names}} status={{.Status}} image={{.Image}}'
+docker inspect --format \
+  'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+  <container-name>
+docker top <container-name> -eo pid,comm,args
+docker stats --no-stream <container-name>
+docker logs --tail 200 --timestamps <container-name>
+```
+
+If `oom=True`, Firefox or another display process exhausted the container memory limit. Lower the number of simultaneous sessions or adjust `AI_DASHBOARD_BROWSER_MEMORY_LIMIT` deliberately, then restart the session. If the process list lacks `websockify`, the supervisor should have logged a websockify restart; if it lacks `Xvnc` or Firefox, the container was intentionally stopped and Meridian will recreate it from the same profile volume.
 
 Meridian invokes the Docker CLI directly; it does not use the Docker Python SDK. Failed commands now log their full command line, stdout, stderr and exit status. To test the X window lookup manually:
 

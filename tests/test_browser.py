@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from ai_dashboard.browser import api as browser_api
 from ai_dashboard.browser.auth import BrowserAuth, hash_password, save_accounts, verify_password
 from ai_dashboard.browser.sessions import (
     _WINDOW_SEARCH,
@@ -33,6 +36,8 @@ class FakeRuntime:
         self.cleaned = False
         self.ready_ports: list[int] = []
         self.ready_names: list[str] = []
+        self.diagnostics_calls: list[str] = []
+        self.fail_ready = False
 
     async def available(self) -> bool:
         return True
@@ -45,6 +50,9 @@ class FakeRuntime:
     async def wait_ready(self, name: str, port: int) -> None:
         self.ready_names.append(name)
         self.ready_ports.append(port)
+        if self.fail_ready:
+            self.fail_ready = False
+            raise BrowserUnavailable("The browser window did not start in time.")
 
     async def remove(self, name: str) -> None:
         self.removals.append(name)
@@ -58,6 +66,10 @@ class FakeRuntime:
 
     async def run_command(self, name: str, args: list[str]) -> None:
         self.commands.append((name, args))
+
+    async def diagnostics(self, name: str) -> str:
+        self.diagnostics_calls.append(name)
+        return "state: running oom_killed=False\nprocesses:\n1 Xvnc\n2 websockify"
 
     async def cleanup_orphans(self) -> None:
         self.cleaned = True
@@ -198,6 +210,64 @@ def test_browser_session_is_reused_and_can_be_closed(
     assert runtime.removals
 
 
+def test_vnc_asset_retries_transient_proxy_failure_without_restart(
+    browser_settings: Settings,
+    sources: list[SourceConfig],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, runtime = make_app(browser_settings, sources)
+    calls = 0
+
+    async def fake_fetch(port: int, path: str) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ConnectError("websockify temporarily unavailable")
+        return httpx.Response(200, content=b"noVNC", headers={"content-type": "text/html"})
+
+    monkeypatch.setattr(browser_api, "_DISPLAY_RETRY_DELAY_SECONDS", 0)
+    monkeypatch.setattr(browser_api, "_fetch_display_asset", fake_fetch)
+
+    with client:
+        login(client)
+        session = client.post("/api/browser/sessions", json={}).json()
+        response = client.get(f"/api/browser/sessions/{session['id']}/vnc/vnc_lite.html")
+
+    assert response.status_code == 200
+    assert response.content == b"noVNC"
+    assert runtime.restarts == []
+
+
+def test_vnc_asset_recovers_dead_display_without_changing_profile(
+    browser_settings: Settings,
+    sources: list[SourceConfig],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, runtime = make_app(browser_settings, sources)
+    calls = 0
+
+    async def fake_fetch(port: int, path: str) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise httpx.ConnectError("websockify is not responding")
+        return httpx.Response(200, content=b"noVNC", headers={"content-type": "text/html"})
+
+    monkeypatch.setattr(browser_api, "_DISPLAY_RETRY_DELAY_SECONDS", 0)
+    monkeypatch.setattr(browser_api, "_fetch_display_asset", fake_fetch)
+
+    with client:
+        login(client)
+        session = client.post("/api/browser/sessions", json={}).json()
+        response = client.get(f"/api/browser/sessions/{session['id']}/vnc/vnc_lite.html")
+
+    assert response.status_code == 200
+    assert runtime.restarts == [runtime.starts[0].name]
+    assert runtime.diagnostics_calls == [runtime.starts[0].name]
+    assert len(runtime.starts) == 1
+    assert runtime.starts[0].volume.startswith("meridian-browser-home-")
+
+
 def test_browser_rejects_privileged_or_invalid_targets(
     browser_settings: Settings, sources: list[SourceConfig]
 ) -> None:
@@ -317,6 +387,48 @@ async def test_manager_waits_for_display_after_running_restart(
     assert restarted.id == session.id
 
 
+async def test_manager_recreates_container_when_restart_never_becomes_ready(
+    browser_settings: Settings,
+) -> None:
+    runtime = FakeRuntime()
+    manager = BrowserSessionManager(browser_settings, runtime)
+    session = await manager.get_or_create("alice")
+    first_port = session.port
+    runtime.fail_ready = True
+
+    restarted = await manager.restart(session.id, "alice")
+
+    assert runtime.restarts == [session.container]
+    assert runtime.removals == [session.container]
+    assert len(runtime.starts) == 2
+    assert restarted.port != first_port
+    assert runtime.starts[0].volume == runtime.starts[1].volume
+
+
+async def test_manager_recovers_display_and_keeps_profile_volume(
+    browser_settings: Settings,
+) -> None:
+    runtime = FakeRuntime()
+    manager = BrowserSessionManager(browser_settings, runtime)
+    session = await manager.get_or_create("alice")
+
+    recovered = await manager.recover_display(
+        session.id, "alice", reason="noVNC asset request failed"
+    )
+
+    assert recovered.id == session.id
+    assert recovered.port == session.port
+    assert runtime.restarts == [session.container]
+    assert runtime.diagnostics_calls == [session.container]
+    assert len(runtime.starts) == 1
+    assert runtime.starts[0].volume.startswith("meridian-browser-home-")
+
+    again = await manager.recover_display(session.id, "alice", reason="display still failing")
+    assert again.id == session.id
+    assert runtime.restarts == [session.container]
+    assert runtime.diagnostics_calls == [session.container]
+
+
 def test_manager_stop_removes_sessions(browser_settings: Settings) -> None:
     async def run() -> tuple[int, int]:
         runtime = FakeRuntime()
@@ -414,7 +526,7 @@ def test_docker_start_reports_diagnostics_before_cleanup(
         volume="meridian-browser-home-test",
         network="meridian-browser-test",
         novnc_port=6080,
-        memory="900m",
+        memory="1200m",
         cpus="1.5",
     )
 
@@ -521,3 +633,66 @@ def test_browser_image_uses_uid_1000() -> None:
     ).read_text(encoding="utf-8")
 
     assert "--uid 1000" in dockerfile
+    assert "HEALTHCHECK" in dockerfile
+    assert "procps" in dockerfile
+
+
+def test_docker_diagnostics_report_oom_processes_and_resources(
+    browser_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = DockerRuntime(browser_settings)
+
+    async def fake_execute(*args: str, timeout: float = 20.0) -> tuple[str, str, int]:
+        if args[0] == "inspect":
+            state = {
+                "Status": "exited",
+                "Running": False,
+                "ExitCode": 137,
+                "OOMKilled": True,
+                "Error": "",
+                "Health": {"Status": "unhealthy"},
+            }
+            return json.dumps(state), "", 0
+        if args[0] == "top":
+            return "PID COMMAND\n1 Xvnc\n2 websockify\n3 firefox-esr", "", 0
+        if args[0] == "stats":
+            return "memory=1.1GiB / 1.2GiB cpu=4.00%", "", 0
+        if args[0] == "logs":
+            return "Firefox content process terminated", "", 0
+        return "", "", 1
+
+    monkeypatch.setattr(runtime, "_execute", fake_execute)
+
+    diagnostics = asyncio.run(runtime.diagnostics("meridian-browser-test"))
+
+    assert "oom_killed=True" in diagnostics
+    assert "health=unhealthy" in diagnostics
+    assert "memory=1.1GiB / 1.2GiB" in diagnostics
+    assert "websockify" in diagnostics
+    assert "Firefox content process terminated" in diagnostics
+
+
+def test_container_supervisor_restarts_websockify_and_health_checks_display() -> None:
+    script = (
+        Path(__file__).resolve().parents[1] / "docker" / "firefox" / "start-session.sh"
+    ).read_text(encoding="utf-8")
+
+    assert script.startswith("#!/bin/bash")
+    assert "wait -n -p" in script
+    assert "restarting unresponsive websockify" in script
+    assert "websockify exited with status" in script
+    assert "Xvnc health check failed" in script
+
+
+def test_firefox_policy_limits_content_processes_and_memory_pressure() -> None:
+    policies = json.loads(
+        (Path(__file__).resolve().parents[1] / "docker" / "firefox" / "policies.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    preferences = policies["policies"]["Preferences"]
+
+    assert preferences["dom.ipc.processCount"]["Value"] == 2
+    assert preferences["browser.tabs.unloadOnLowMemory"]["Value"] is True
+    assert preferences["browser.sessionstore.resume_from_crash"]["Value"] is False

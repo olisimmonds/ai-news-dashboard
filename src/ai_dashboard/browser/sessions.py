@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import secrets
 import time
@@ -26,6 +27,7 @@ _WINDOW_SEARCH = (
 )
 _BROWSER_UID = "1000"
 _BROWSER_XAUTHORITY = "/home/browser/.Xauthority"
+_DISPLAY_RECOVERY_COOLDOWN_SECONDS = 15.0
 
 
 class BrowserError(RuntimeError):
@@ -87,6 +89,8 @@ class BrowserRuntime(Protocol):
     async def is_running(self, name: str) -> bool: ...
 
     async def run_command(self, name: str, args: list[str]) -> None: ...
+
+    async def diagnostics(self, name: str) -> str: ...
 
     async def cleanup_orphans(self) -> None: ...
 
@@ -231,30 +235,63 @@ class DockerRuntime:
 
     async def _diagnostics(self, name: str) -> str:
         try:
-            state, state_error, state_code = await self._execute(
-                "inspect",
-                "--format",
-                (
-                    "status={{.State.Status}} running={{.State.Running}} "
-                    "exit={{.State.ExitCode}} error={{.State.Error}}"
-                ),
-                name,
-                timeout=10,
+            raw_state, state_error, state_code = await self._execute(
+                "inspect", "--format", "{{json .State}}", name, timeout=5
             )
-            if state_code != 0:
-                state = state_error or state or f"docker inspect exited {state_code}"
-        except BrowserUnavailable as exc:
+            if state_code == 0:
+                state_data = json.loads(raw_state)
+                health = state_data.get("Health")
+                state = (
+                    f"status={state_data.get('Status')} "
+                    f"running={state_data.get('Running')} "
+                    f"exit={state_data.get('ExitCode')} "
+                    f"oom_killed={state_data.get('OOMKilled')} "
+                    f"error={state_data.get('Error')} "
+                    f"health={health.get('Status') if health else 'none'}"
+                )
+            else:
+                state = state_error or raw_state or f"docker inspect exited {state_code}"
+        except (BrowserUnavailable, json.JSONDecodeError, AttributeError) as exc:
             state = str(exc)
 
         try:
+            processes, processes_error, processes_code = await self._execute(
+                "top", name, "-eo", "pid,comm,args", timeout=5
+            )
+            processes = (
+                "\n".join(part for part in (processes, processes_error) if part)
+                or f"docker top exited {processes_code}"
+            )
+        except BrowserUnavailable as exc:
+            processes = str(exc)
+
+        try:
+            resources, resources_error, _resources_code = await self._execute(
+                "stats",
+                "--no-stream",
+                "--format",
+                "memory={{.MemUsage}} cpu={{.CPUPerc}}",
+                name,
+                timeout=5,
+            )
+            resources = "\n".join(part for part in (resources, resources_error) if part) or (
+                "(no resource data)"
+            )
+        except BrowserUnavailable as exc:
+            resources = str(exc)
+
+        try:
             logs, logs_error, _logs_code = await self._execute(
-                "logs", "--tail", "200", "--timestamps", name, timeout=10
+                "logs", "--tail", "200", "--timestamps", name, timeout=5
             )
             logs = "\n".join(part for part in (logs, logs_error) if part) or "(no logs)"
         except BrowserUnavailable as exc:
             logs = str(exc)
 
-        return f"state: {state}\nlogs:\n{logs}"
+        return f"state: {state}\nresources: {resources}\nprocesses:\n{processes}\nlogs:\n{logs}"
+
+    async def diagnostics(self, name: str) -> str:
+        return await self._diagnostics(name)
 
     async def _report_start_failure(self, name: str, error: Exception) -> None:
         try:
@@ -396,6 +433,7 @@ class BrowserSessionManager:
         self._clock = clock
         self._sessions: dict[str, BrowserSession] = {}
         self._by_user: dict[str, str] = {}
+        self._last_display_recovery: dict[str, float] = {}
         self._lock = asyncio.Lock()
         self._reaper: asyncio.Task[None] | None = None
 
@@ -452,6 +490,7 @@ class BrowserSessionManager:
             sessions = list(self._sessions.values())
             self._sessions.clear()
             self._by_user.clear()
+            self._last_display_recovery.clear()
             if await self._runtime.available():
                 await asyncio.gather(
                     *(self._runtime.remove(session.container) for session in sessions),
@@ -497,6 +536,7 @@ class BrowserSessionManager:
             session = self.get(session_id, username)
             self._sessions.pop(session_id, None)
             self._by_user.pop(username, None)
+            self._last_display_recovery.pop(session_id, None)
         try:
             await self._runtime.remove(session.container)
         except BrowserError:
@@ -505,14 +545,66 @@ class BrowserSessionManager:
     async def restart(self, session_id: str, username: str) -> BrowserSession:
         async with self._lock:
             session = self.get(session_id, username)
-            if await self._runtime.is_running(session.container):
+            await self._restart_or_recreate(session, username)
+            now = self._clock()
+            self._last_display_recovery[session_id] = now
+            session.last_activity = now
+            return session
+
+    async def recover_display(
+        self, session_id: str, username: str, *, reason: str
+    ) -> BrowserSession:
+        async with self._lock:
+            session = self.get(session_id, username)
+            now = self._clock()
+            last = self._last_display_recovery.get(session_id, 0.0)
+            if now - last < _DISPLAY_RECOVERY_COOLDOWN_SECONDS:
+                logger.info(
+                    "Skipping duplicate display recovery for %s; retrying display",
+                    session.container,
+                )
+                return session
+            self._last_display_recovery[session_id] = now
+            await self.report_display_failure(session_id, username, reason=reason)
+            try:
+                await self._restart_or_recreate(session, username)
+            except BrowserError as exc:
+                logger.error("Browser display recovery failed for %s: %s", session.container, exc)
+                raise BrowserUnavailable("The browser display could not be recovered.") from exc
+            session.last_activity = self._clock()
+            logger.info("Recovered browser display for %s", session.container)
+            return session
+
+    async def report_display_failure(self, session_id: str, username: str, *, reason: str) -> None:
+        session = self.get(session_id, username)
+        try:
+            details = await self._runtime.diagnostics(session.container)
+        except Exception:
+            logger.exception("Could not collect display diagnostics for %s", session.container)
+            details = "diagnostics unavailable"
+        logger.error(
+            "Browser display failure for %s on port %s: %s\n%s",
+            session.container,
+            session.port,
+            reason,
+            details,
+        )
+
+    async def _restart_or_recreate(self, session: BrowserSession, username: str) -> None:
+        if await self._runtime.is_running(session.container):
+            try:
                 await self._runtime.restart(session.container)
                 await self._runtime.wait_ready(session.container, session.port)
-            else:
-                await self._runtime.remove(session.container)
-                session.port = await self._runtime.start(self._spec(username))
-            session.last_activity = self._clock()
-            return session
+                return
+            except BrowserError as exc:
+                logger.error(
+                    "Browser container %s did not recover from restart: %s",
+                    session.container,
+                    exc,
+                )
+        await self._runtime.remove(session.container)
+        logger.info("Recreating browser container %s", session.container)
+        session.port = await self._runtime.start(self._spec(username))
 
     def _spec(self, username: str) -> ContainerSpec:
         user_key = hashlib.sha256(username.encode("utf-8")).hexdigest()[:16]

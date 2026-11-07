@@ -7,6 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
+        bash \
         ca-certificates \
         curl \
         dbus-x11 \
@@ -16,6 +17,7 @@ RUN apt-get update \
         gosu \
         novnc \
         openbox \
+        procps \
         tigervnc-standalone-server \
         websockify \
         xdotool \
@@ -30,8 +32,12 @@ RUN useradd --create-home --uid 1000 --shell /usr/sbin/nologin browser \
 COPY policies.json /etc/firefox-esr/policies/policies.json
 COPY entrypoint.sh /usr/local/bin/entrypoint
 COPY start-session.sh /usr/local/bin/start-session
+COPY healthcheck.sh /usr/local/bin/healthcheck
 
-RUN chmod 0755 /usr/local/bin/entrypoint /usr/local/bin/start-session
+RUN chmod 0755 /usr/local/bin/entrypoint /usr/local/bin/start-session /usr/local/bin/healthcheck
+
+HEALTHCHECK --interval=15s --timeout=8s --start-period=60s --retries=3 \
+    CMD ["/usr/local/bin/healthcheck"]
 
 EXPOSE 6080
 
