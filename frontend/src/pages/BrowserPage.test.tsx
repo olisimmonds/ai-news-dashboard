@@ -110,6 +110,30 @@ describe("BrowserPage", () => {
     expect(await screen.findByText("Where would you like to go?")).toBeVisible();
   });
 
+  it("restarts the display after noVNC reports a failed reconnect", async () => {
+    mocked.getBrowserStatus.mockResolvedValue(
+      makeBrowserStatus({
+        authenticated: true,
+        user: "alice",
+        active_sessions: 1,
+        session: makeBrowserSession(),
+      }),
+    );
+    renderPage();
+
+    await screen.findByTitle("Private Firefox browser");
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        data: { type: "meridian-browser-reconnect-failed" },
+        origin: window.location.origin,
+      }),
+    );
+
+    await waitFor(() => {
+      expect(mocked.restartBrowserSession).toHaveBeenCalledWith("session-1");
+    });
+  });
+
   it("navigates and closes an active session", async () => {
     const user = userEvent.setup();
     mocked.getBrowserStatus.mockResolvedValue(

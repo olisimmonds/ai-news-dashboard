@@ -189,6 +189,7 @@ def test_browser_requires_auth_and_can_start_a_session(
     assert response.status_code == 201
     payload = response.json()
     assert payload["vnc_url"].startswith("/api/browser/sessions/")
+    assert "/vnc/meridian.html" in payload["vnc_url"]
     assert "scale=true" in payload["vnc_url"]
     assert "path=api%2Fbrowser%2Fsessions%2F" in payload["vnc_url"]
     assert "view_only" not in payload["vnc_url"]
@@ -732,6 +733,9 @@ def test_container_supervisor_shuts_down_cleanly_and_quarantines_crash_state() -
     assert "ctrl+q" in script
     assert "stop_child \"$FIREFOX_PID\" \"Firefox\" 10" in script
     assert "unclean-shutdown" in script
+    assert "profile-path" in script
+    assert "profiles.ini" in script
+    assert '--profile "$PROFILE_DIR"' in script
     assert "sessionstore.jsonlz4" in script
     assert "sessionCheckpoints.json" in script
     assert "sessionstore-backups" in script
@@ -750,7 +754,20 @@ def test_container_image_collects_crashes_and_uses_graceful_stop() -> None:
     assert "MOZ_CRASHREPORTER_NO_REPORT=1" in dockerfile
     assert "MERIDIAN_BROWSER_DIAGNOSTICS_DIR=/home/browser/.meridian/diagnostics" in dockerfile
     assert "/home/browser/.meridian/diagnostics" in dockerfile
+    assert "COPY meridian.html /usr/share/novnc/meridian.html" in dockerfile
     assert "STOPSIGNAL SIGTERM" in dockerfile
+
+
+def test_custom_novnc_page_reconnects_after_display_disconnect() -> None:
+    page = (
+        Path(__file__).resolve().parents[1] / "docker" / "firefox" / "meridian.html"
+    ).read_text(encoding="utf-8")
+
+    assert "MAX_RECONNECT_ATTEMPTS" in page
+    assert "scheduleReconnect" in page
+    assert 'addEventListener("disconnect"' in page
+    assert "meridian-browser-reconnect-failed" in page
+    assert "rfb.scaleViewport" in page
 
 
 def test_docker_uses_graceful_stop_and_restart_timeouts(
@@ -773,6 +790,27 @@ def test_docker_uses_graceful_stop_and_restart_timeouts(
         ("stop", "--time", "30", "meridian-browser-test"),
         ("rm", "--force", "meridian-browser-test"),
         ("restart", "--time", "30", "meridian-browser-test"),
+    ]
+
+
+def test_manager_records_diagnostics_when_container_exits(
+    browser_settings: Settings,
+) -> None:
+    runtime = FakeRuntime()
+    manager = BrowserSessionManager(browser_settings, runtime)
+
+    async def scenario() -> tuple[str, str]:
+        session = await manager.get_or_create("alice")
+        runtime.running.discard(session.container)
+        await manager._check_sessions()
+        await manager._check_sessions()
+        return session.id, session.container
+
+    _, container = asyncio.run(scenario())
+    assert manager.for_user("alice") is not None
+    assert runtime.diagnostics_calls == [container]
+    assert runtime.persisted == [
+        (container, "container exited while session was active")
     ]
 
 

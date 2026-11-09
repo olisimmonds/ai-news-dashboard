@@ -30,6 +30,7 @@ _WINDOW_SEARCH = (
 _BROWSER_UID = "1000"
 _BROWSER_XAUTHORITY = "/home/browser/.Xauthority"
 _DISPLAY_RECOVERY_COOLDOWN_SECONDS = 15.0
+_SESSION_MONITOR_INTERVAL_SECONDS = 5.0
 
 
 class BrowserError(RuntimeError):
@@ -507,8 +508,10 @@ class BrowserSessionManager:
         self._sessions: dict[str, BrowserSession] = {}
         self._by_user: dict[str, str] = {}
         self._last_display_recovery: dict[str, float] = {}
+        self._dead_reported: set[str] = set()
         self._lock = asyncio.Lock()
         self._reaper: asyncio.Task[None] | None = None
+        self._monitor: asyncio.Task[None] | None = None
 
     @property
     def enabled(self) -> bool:
@@ -548,6 +551,9 @@ class BrowserSessionManager:
         if not self.enabled:
             return
         self._reaper = asyncio.create_task(self._reap_loop(), name="meridian-browser-reaper")
+        self._monitor = asyncio.create_task(
+            self._monitor_loop(), name="meridian-browser-monitor"
+        )
         if await self._runtime.available():
             try:
                 await self._runtime.cleanup_orphans()
@@ -559,11 +565,16 @@ class BrowserSessionManager:
             self._reaper.cancel()
             await asyncio.gather(self._reaper, return_exceptions=True)
             self._reaper = None
+        if self._monitor is not None:
+            self._monitor.cancel()
+            await asyncio.gather(self._monitor, return_exceptions=True)
+            self._monitor = None
         if self.enabled:
             sessions = list(self._sessions.values())
             self._sessions.clear()
             self._by_user.clear()
             self._last_display_recovery.clear()
+            self._dead_reported.clear()
             if await self._runtime.available():
                 await asyncio.gather(
                     *(self._runtime.remove(session.container) for session in sessions),
@@ -584,6 +595,7 @@ class BrowserSessionManager:
                 )
                 self._sessions.pop(existing.id, None)
                 self._by_user.pop(username, None)
+                self._dead_reported.discard(existing.id)
 
             if len(self._sessions) >= self._settings.browser_max_sessions:
                 raise BrowserLimitReached(
@@ -613,6 +625,7 @@ class BrowserSessionManager:
             self._sessions.pop(session_id, None)
             self._by_user.pop(username, None)
             self._last_display_recovery.pop(session_id, None)
+            self._dead_reported.discard(session_id)
         try:
             await self._runtime.remove(session.container)
         except BrowserError:
@@ -758,6 +771,32 @@ class BrowserSessionManager:
         for session in expired:
             await self.remove(session.id, session.user)
             logger.info("Closed idle browser session for %s", session.user)
+
+    async def _check_sessions(self) -> None:
+        if not self.enabled or not await self._runtime.available():
+            return
+        for session in list(self._sessions.values()):
+            if self._sessions.get(session.id) is not session:
+                continue
+            if await self._runtime.is_running(session.container):
+                self._dead_reported.discard(session.id)
+                continue
+            if session.id in self._dead_reported:
+                continue
+            self._dead_reported.add(session.id)
+            await self._record_diagnostics(
+                session.container, "container exited while session was active"
+            )
+
+    async def _monitor_loop(self) -> None:
+        while True:
+            await asyncio.sleep(_SESSION_MONITOR_INTERVAL_SECONDS)
+            try:
+                await self._check_sessions()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Could not monitor browser sessions")
 
     async def _reap_loop(self) -> None:
         while True:

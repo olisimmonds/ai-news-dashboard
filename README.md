@@ -130,7 +130,8 @@ The private browser is deliberately separate from the news database. A phone ope
 - Firefox force-installs uBlock Origin, blocks popups, enables tracking protection, disables telemetry, password storage and app updates.
 - Firefox is capped at two content processes and is configured not to restore tabs after a crash, reducing memory pressure on the Pi.
 - The container asks Firefox to quit, then falls back to SIGTERM and a bounded wait before killing it, so a normal restart writes a clean profile. If the previous run ended uncleanly, only the session-restore files are moved aside into the profile volume; bookmarks, history, cookies, logins and favourites are kept. This prevents the Firefox "Sorry. We're having trouble getting your pages back." screen from trapping the browser after an OOM kill or forced restart.
-- Crash reporter minidumps, cgroup memory counters, process lists and session-file sizes are written under `/home/browser/.meridian/diagnostics` inside the profile volume. Meridian also saves Docker state, limits, OOM flag and logs to `data/browser-diagnostics` on the host.
+- The container includes a Meridian noVNC page that reconnects automatically after a display WebSocket drops, then asks Meridian to restart the display if reconnection keeps failing. The proxy logs client and upstream close codes so the next disconnect has a recorded cause.
+- Crash reporter minidumps, cgroup memory counters, process lists and session-file sizes are written under `/home/browser/.meridian/diagnostics` inside the profile volume. Meridian also saves Docker state, limits, OOM flag and logs to `data/browser-diagnostics` on the host, including when a container exits while a session is still active.
 - The container has a Docker health check for Xvnc, openbox, websockify and Firefox. The startup supervisor restarts a dead or unresponsive websockify/openbox process and exits the container if Xvnc or Firefox disappears.
 - Meridian retries a failed display request, then stops and restarts the container in place when the display is genuinely stale. The named profile volume is retained.
 - There is no phone-side file transfer, host folder mount or clipboard permission granted to the embedded display. Downloads remain inside the user's browser volume.
@@ -198,22 +199,26 @@ docker run --detach --name meridian-firefox-smoke --shm-size=512m \
   -p 127.0.0.1:6080:6080 meridian-firefox:latest
 
 curl --fail --silent --show-error --output /dev/null \
-  http://127.0.0.1:6080/vnc_lite.html && echo "noVNC OK"
+  http://127.0.0.1:6080/meridian.html && echo "noVNC OK"
 docker logs --tail 200 --timestamps meridian-firefox-smoke
 ```
 
-Open <http://127.0.0.1:6080/vnc_lite.html> to confirm Firefox is visible. A 200 from noVNC only proves that websockify is serving; it does not prove Firefox started. Meridian also waits for a visible Firefox window and logs the container state plus its last 200 log lines before cleaning up a failed session. On the Pi, check those diagnostics with `journalctl -u meridian -n 200 --no-pager`.
+Open <http://127.0.0.1:6080/meridian.html> to confirm Firefox is visible. A 200 from noVNC only proves that websockify is serving; it does not prove Firefox started. Meridian also waits for a visible Firefox window and logs the container state plus its last 200 log lines before cleaning up a failed session. On the Pi, check those diagnostics with `journalctl -u meridian -n 200 --no-pager`.
 
 ### Display disconnects
 
 `The browser display is not responding` is Meridian's proxy error: the container's noVNC/websockify endpoint did not answer. It does not by itself prove Firefox crashed. A browser that still accepts navigation but cannot serve noVNC usually has a dead or wedged websockify process; a container that has disappeared or was OOM-killed also produces the same panel.
 
-Meridian now logs the Docker state, OOM flag, health status, memory/CPU usage, process list and the last 200 container log lines when the display fails. It also retries the request and restarts the container in place if the display does not recover. The profile volume is preserved.
+The custom noVNC page now reconnects automatically when the display WebSocket closes. If the container is still running, the reconnected display continues in the same session. If the container has exited, Meridian restarts it before serving the reconnected WebSocket. After repeated reconnect failures the page asks Meridian to restart the display automatically.
+
+Meridian logs the client and upstream WebSocket close codes, the Docker state, OOM flag, health status, memory/CPU usage, process list and the last 200 container log lines when the display fails or a container exits during an active session. It also retries the request and restarts the container in place if the display does not recover. The profile volume is preserved.
 
 Inspect the exact failure on the Pi with:
 
 ```bash
 journalctl -u meridian -n 300 --no-pager
+journalctl -u meridian -n 300 --no-pager | grep -E 'browser vnc|websocket|close code|display|session'
+journalctl -k --since '1 hour ago' | grep -Ei 'oom|killed process|firefox|Xvnc'
 docker ps -a --filter label=meridian.browser.session=1 \
   --format 'name={{.Names}} status={{.Status}} image={{.Image}}'
 docker inspect --format \
@@ -247,7 +252,7 @@ docker build -t meridian-firefox:latest docker/firefox
 sudo systemctl restart meridian
 ```
 
-The existing `meridian-browser-home-*` volumes are reused. If a browser is currently stuck on the Firefox recovery page, close the session from Meridian or stop the container once; the next start quarantines the stale session files and opens a clean window without touching bookmarks or favourites.
+The existing `meridian-browser-home-*` volumes are reused. The supervisor records the selected Firefox profile in `.meridian/diagnostics/profile-path` and launches Firefox with `--profile`, so crash cleanup always targets the profile Firefox actually used. If a browser is currently stuck on the Firefox recovery page, close the session from Meridian or stop the container once; the next start quarantines the stale session files and opens a clean window without touching bookmarks or favourites.
 
 If the problem recurs, collect these files before removing any container:
 

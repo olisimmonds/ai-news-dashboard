@@ -35,6 +35,7 @@ RUN useradd --create-home --uid 1000 --shell /usr/sbin/nologin browser \
     && chown -R browser:browser /home/browser
 
 COPY policies.json /etc/firefox-esr/policies/policies.json
+COPY meridian.html /usr/share/novnc/meridian.html
 COPY entrypoint.sh /usr/local/bin/entrypoint
 COPY start-session.sh /usr/local/bin/start-session
 COPY healthcheck.sh /usr/local/bin/healthcheck

@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+    <title>Meridian Firefox</title>
+    <style>
+        body {
+            margin: 0;
+            background-color: dimgrey;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+        }
+        html { height: 100%; }
+        #top_bar {
+            background-color: #6e84a3;
+            color: white;
+            font: bold 12px Helvetica;
+            padding: 6px 5px 4px 5px;
+            border-bottom: 1px outset;
+        }
+        #status { text-align: center; }
+        #sendCtrlAltDelButton {
+            position: fixed;
+            top: 0px;
+            right: 0px;
+            border: 1px outset;
+            padding: 5px 5px 4px 5px;
+            cursor: pointer;
+        }
+        #screen {
+            flex: 1;
+            overflow: hidden;
+        }
+    </style>
+
+    <script type="module" crossorigin="anonymous">
+        import RFB from './core/rfb.js';
+
+        const MAX_RECONNECT_ATTEMPTS = 12;
+        const STABLE_CONNECTION_MS = 15000;
+
+        let rfb = null;
+        let desktopName = "";
+        let reconnectAttempts = 0;
+        let reconnectTimer = null;
+        let connectedAt = 0;
+
+        function status(text) {
+            document.getElementById('status').textContent = text;
+        }
+
+        function notifyParent(type, detail) {
+            if (window.parent === window) return;
+            window.parent.postMessage(
+                { type, detail },
+                window.location.origin,
+            );
+        }
+
+        function readQueryVariable(name, defaultValue) {
+            const re = new RegExp('.*[?&]' + name + '=([^&#]*)');
+            const match = ''.concat(document.location.href, window.location.hash).match(re);
+            if (match) return decodeURIComponent(match[1]);
+            return defaultValue;
+        }
+
+        const host = readQueryVariable('host', window.location.hostname);
+        const port = readQueryVariable('port', window.location.port);
+        const password = readQueryVariable('password');
+        const path = readQueryVariable('path', 'websockify');
+        const viewOnly = readQueryVariable('view_only', false);
+        const scaleViewport = readQueryVariable('scale', false);
+
+        let url;
+        if (window.location.protocol === "https:") {
+            url = 'wss';
+        } else {
+            url = 'ws';
+        }
+        url += '://' + host;
+        if (port) url += ':' + port;
+        url += '/' + path;
+
+        function scheduleReconnect(reason) {
+            if (reconnectTimer) return;
+            if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+                status("Connection lost. Select Reconnect display.");
+                notifyParent("meridian-browser-reconnect-failed", { reason });
+                return;
+            }
+            const delay = Math.min(1000 * (2 ** reconnectAttempts), 8000);
+            reconnectAttempts += 1;
+            status(`Reconnecting in ${Math.round(delay / 1000)}s (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+            reconnectTimer = setTimeout(() => {
+                reconnectTimer = null;
+                connect();
+            }, delay);
+        }
+
+        function credentialsAreRequired() {
+            const supplied = prompt("Password Required:");
+            if (rfb) rfb.sendCredentials({ password: supplied });
+        }
+
+        function updateDesktopName(event) {
+            desktopName = event.detail.name;
+        }
+
+        function sendCtrlAltDel() {
+            if (rfb) rfb.sendCtrlAltDel();
+            return false;
+        }
+
+        function connect() {
+            const screen = document.getElementById('screen');
+            screen.replaceChildren();
+            status(reconnectAttempts > 0 ? "Reconnecting..." : "Connecting");
+
+            try {
+                rfb = new RFB(screen, url, { credentials: { password } });
+            } catch (error) {
+                status("Could not create the display connection.");
+                scheduleReconnect(String(error));
+                return;
+            }
+
+            rfb.addEventListener("connect", () => {
+                connectedAt = Date.now();
+                status("Connected to " + (desktopName || "Firefox"));
+                notifyParent("meridian-browser-connected", {});
+            });
+            rfb.addEventListener("disconnect", (event) => {
+                const detail = event.detail || {};
+                const wasStable = connectedAt > 0 && Date.now() - connectedAt >= STABLE_CONNECTION_MS;
+                if (wasStable) reconnectAttempts = 0;
+                connectedAt = 0;
+                status(detail.clean ? "Disconnected - reconnecting..." : "Connection lost - reconnecting...");
+                notifyParent("meridian-browser-disconnected", { clean: !!detail.clean });
+                scheduleReconnect(detail.clean ? "clean disconnect" : "unexpected disconnect");
+            });
+            rfb.addEventListener("credentialsrequired", credentialsAreRequired);
+            rfb.addEventListener("desktopname", updateDesktopName);
+
+            rfb.viewOnly = viewOnly;
+            rfb.scaleViewport = scaleViewport;
+        }
+
+        document.getElementById('sendCtrlAltDelButton').onclick = sendCtrlAltDel;
+        connect();
+    </script>
+</head>
+
+<body>
+    <div id="top_bar">
+        <div id="status">Loading</div>
+        <div id="sendCtrlAltDelButton">Send CtrlAltDel</div>
+    </div>
+    <div id="screen"></div>
+</body>
+</html>

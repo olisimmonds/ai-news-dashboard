@@ -187,7 +187,7 @@ def _require_same_origin(request: Request) -> None:
 
 def _vnc_url(session: BrowserSession) -> str:
     websocket_path = quote(f"api/browser/sessions/{session.id}/websockify", safe="")
-    return f"/api/browser/sessions/{session.id}/vnc/vnc_lite.html?scale=true&path={websocket_path}"
+    return f"/api/browser/sessions/{session.id}/vnc/meridian.html?scale=true&path={websocket_path}"
 
 
 async def _fetch_display_asset(port: int, path: str) -> httpx.Response:
@@ -472,12 +472,26 @@ async def websockify(websocket: WebSocket, session_id: str) -> None:
                 return
 
     await websocket.accept(subprotocol=upstream.subprotocol)
+    logger.info(
+        "noVNC proxy connected for %s on port %s (client=%s subprotocol=%s)",
+        session.container,
+        session.port,
+        websocket.client.host if websocket.client else "unknown",
+        upstream.subprotocol or "none",
+    )
+
+    client_close: str | None = None
+    upstream_close: str | None = None
 
     async def client_to_upstream() -> None:
+        nonlocal client_close, upstream_close
         try:
             while True:
                 message = await websocket.receive()
                 if message["type"] == "websocket.disconnect":
+                    client_close = (
+                        f"code={message.get('code')} reason={message.get('reason') or 'none'}"
+                    )
                     break
                 data = message.get("bytes")
                 text = message.get("text")
@@ -486,30 +500,53 @@ async def websockify(websocket: WebSocket, session_id: str) -> None:
                 elif text is not None:
                     await upstream.send(text)
                 manager.touch(session_id, user)
-        except (WebSocketDisconnect, ConnectionClosed):
-            pass
+        except BrowserSessionNotFound:
+            client_close = "session removed while display was connected"
+        except WebSocketDisconnect as exc:
+            client_close = f"code={exc.code} reason={exc.reason or 'none'}"
+        except ConnectionClosed as exc:
+            upstream_close = f"code={getattr(exc, 'code', None)} reason={exc.reason or 'none'}"
+        except Exception:
+            logger.exception("noVNC client-to-upstream proxy failed for %s", session.container)
+            raise
 
     async def upstream_to_client() -> None:
+        nonlocal client_close, upstream_close
         try:
             async for message in upstream:
                 if isinstance(message, bytes):
                     await websocket.send_bytes(message)
                 else:
                     await websocket.send_text(message)
-        except (WebSocketDisconnect, ConnectionClosed):
-            pass
+        except (WebSocketDisconnect, ConnectionClosed) as exc:
+            if isinstance(exc, WebSocketDisconnect):
+                client_close = f"code={exc.code} reason={exc.reason or 'none'}"
+            else:
+                upstream_close = f"code={getattr(exc, 'code', None)} reason={exc.reason or 'none'}"
+        except Exception:
+            logger.exception("noVNC upstream-to-client proxy failed for %s", session.container)
+            raise
 
     tasks = {
         asyncio.create_task(client_to_upstream()),
         asyncio.create_task(upstream_to_client()),
     }
-    _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for task in done:
+        if not task.cancelled() and task.exception() is not None:
+            logger.warning("noVNC proxy task ended with an error for %s", session.container)
     for task in pending:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
     await upstream.close()
     with contextlib.suppress(RuntimeError):
         await websocket.close()
+    logger.info(
+        "noVNC proxy closed for %s (client=%s upstream=%s)",
+        session.container,
+        client_close or "still open",
+        upstream_close or "still open",
+    )
 
 
 def register_browser_exception_handlers(app: FastAPI) -> None:

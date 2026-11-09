@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
 
 import { EmptyState, ErrorState } from "../components/EmptyState";
@@ -127,6 +127,8 @@ export function BrowserPage() {
   const [address, setAddress] = useState("");
   const [frameKey, setFrameKey] = useState(0);
   const frameRef = useRef<HTMLDivElement>(null);
+  const restartRef = useRef<() => void>(() => undefined);
+  const autoRecoveryRef = useRef(false);
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
@@ -159,6 +161,28 @@ export function BrowserPage() {
     void load(controller.signal);
     return () => controller.abort();
   }, [load]);
+
+  useLayoutEffect(() => {
+    restartRef.current = () => void restart();
+  });
+
+  useEffect(() => {
+    function handleDisplayMessage(event: MessageEvent) {
+      if (event.origin !== window.location.origin) return;
+      const data = event.data as { type?: unknown } | null;
+      if (data?.type !== "meridian-browser-reconnect-failed" || autoRecoveryRef.current) {
+        return;
+      }
+      autoRecoveryRef.current = true;
+      restartRef.current();
+      window.setTimeout(() => {
+        autoRecoveryRef.current = false;
+      }, 30000);
+    }
+
+    window.addEventListener("message", handleDisplayMessage);
+    return () => window.removeEventListener("message", handleDisplayMessage);
+  }, []);
 
   function updateSession(session: BrowserSession) {
     setStatus((current) => (current ? { ...current, session } : current));

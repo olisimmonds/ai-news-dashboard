@@ -165,7 +165,7 @@ export function makeBrowserSession(overrides: Partial<BrowserSession> = {}): Bro
     created_at: NOW.toISOString(),
     last_activity_at: NOW.toISOString(),
     idle_timeout_minutes: 20,
-    vnc_url: "/api/browser/sessions/session-1/vnc/vnc_lite.html",
+    vnc_url: "/api/browser/sessions/session-1/vnc/meridian.html",
     ...overrides,
   };
 }

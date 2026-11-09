@@ -7,6 +7,7 @@ log() {
 
 DIAG_DIR="${MERIDIAN_BROWSER_DIAGNOSTICS_DIR:-/home/browser/.meridian/diagnostics}"
 MOZILLA_DIR="${HOME}/.mozilla"
+PROFILE_POINTER="${DIAG_DIR}/profile-path"
 MARKER="${DIAG_DIR}/unclean-shutdown"
 PROFILE_DIR=""
 SHUTTING_DOWN=0
@@ -18,15 +19,75 @@ NOVNC_PID=""
 SLEEP_PID=""
 NOVNC_HEALTH_FAILURES=0
 
+absolute_profile_path() {
+    local path="$1"
+    case "$path" in
+        /*) printf '%s\n' "$path" ;;
+        *) printf '%s\n' "${MOZILLA_DIR}/firefox/${path}" ;;
+    esac
+}
+
+profile_from_profiles_ini() {
+    local ini="${MOZILLA_DIR}/firefox/profiles.ini"
+    local path=""
+    [ -f "$ini" ] || return 1
+    path="$(awk -F= '
+        /^\[Profile[0-9]+\]/ { in_profile=1; is_default=0; profile_path=""; next }
+        /^\[/ { in_profile=0 }
+        in_profile && $1=="Path" { profile_path=$2; if (is_default) { print profile_path; exit } }
+        in_profile && $1=="Default" && $2=="1" { is_default=1; if (profile_path != "") { print profile_path; exit } }
+    ' "$ini" 2>/dev/null || true)"
+    [ -n "$path" ] || return 1
+    absolute_profile_path "$path"
+}
+
+profile_from_installs_ini() {
+    local ini="${MOZILLA_DIR}/firefox/installs.ini"
+    local path=""
+    [ -f "$ini" ] || return 1
+    path="$(awk -F= '/^Default=/{print $2; exit}' "$ini" 2>/dev/null || true)"
+    [ -n "$path" ] || return 1
+    absolute_profile_path "$path"
+}
+
+usable_profile() {
+    local candidate="$1"
+    [ -n "$candidate" ] || return 1
+    [ -d "$candidate" ] || return 1
+    [ -f "${candidate}/prefs.js" ] || [ -f "${candidate}/times.json" ]
+}
+
 find_profile() {
     local candidate
-    for candidate in "${MOZILLA_DIR}"/firefox/*/; do
-        [ -d "$candidate" ] || continue
-        if [ -f "${candidate}prefs.js" ] || [ -f "${candidate}times.json" ]; then
-            printf '%s\n' "${candidate%/}"
+    if [ -f "$PROFILE_POINTER" ]; then
+        candidate="$(head -n 1 "$PROFILE_POINTER" 2>/dev/null || true)"
+        if usable_profile "$candidate"; then
+            printf '%s\n' "$candidate"
             return 0
         fi
-    done
+    fi
+
+    candidate="$(profile_from_installs_ini || true)"
+    if usable_profile "$candidate"; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+
+    candidate="$(profile_from_profiles_ini || true)"
+    if usable_profile "$candidate"; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+
+    candidate="$(
+        find "${MOZILLA_DIR}/firefox" -mindepth 2 -maxdepth 2 -name prefs.js \
+            -printf '%T@ %h\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2- || true
+    )"
+    if usable_profile "$candidate"; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+
     return 1
 }
 
@@ -123,6 +184,11 @@ prepare_profile() {
     local unclean=0
     mkdir -p "$DIAG_DIR"
     PROFILE_DIR="$(find_profile || true)"
+    if [ -z "$PROFILE_DIR" ]; then
+        PROFILE_DIR="${MOZILLA_DIR}/firefox/meridian.default"
+    fi
+    mkdir -p "$PROFILE_DIR"
+    printf '%s\n' "$PROFILE_DIR" > "$PROFILE_POINTER"
 
     if [ -f "$MARKER" ]; then
         unclean=1
@@ -130,19 +196,18 @@ prepare_profile() {
 
     if [ "$unclean" -eq 1 ]; then
         log "previous browser session ended uncleanly"
-        if [ -n "$PROFILE_DIR" ]; then
-            find "$MOZILLA_DIR" -name lock -delete 2>/dev/null || true
-            find "$MOZILLA_DIR" -name .parentlock -delete 2>/dev/null || true
-            quarantine_session_state "$PROFILE_DIR"
-        fi
+        find "$MOZILLA_DIR" -name lock -delete 2>/dev/null || true
+        find "$MOZILLA_DIR" -name .parentlock -delete 2>/dev/null || true
+        quarantine_session_state "$PROFILE_DIR"
     fi
 
-    if [ -n "$PROFILE_DIR" ] && [ ! -f "$PROFILE_DIR/user.js" ]; then
+    if [ ! -f "$PROFILE_DIR/user.js" ]; then
         write_user_js "$PROFILE_DIR"
     fi
 
     rm -f "$MARKER"
     : > "$MARKER"
+    log "using Firefox profile $PROFILE_DIR"
     persist_snapshot "startup"
 }
 
@@ -318,8 +383,8 @@ start_websockify() {
 
 start_websockify
 
-log "starting Firefox"
-firefox-esr --no-remote --name meridian-browser --class MeridianBrowser &
+log "starting Firefox with profile $PROFILE_DIR"
+firefox-esr --no-remote --profile "$PROFILE_DIR" --name meridian-browser --class MeridianBrowser &
 FIREFOX_PID=$!
 log "Firefox pid=$FIREFOX_PID"
 
