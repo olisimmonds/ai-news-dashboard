@@ -6,10 +6,12 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import secrets
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Protocol
 
 import httpx
@@ -92,6 +94,8 @@ class BrowserRuntime(Protocol):
 
     async def diagnostics(self, name: str) -> str: ...
 
+    async def persist_diagnostics(self, name: str, details: str, *, reason: str) -> str | None: ...
+
     async def cleanup_orphans(self) -> None: ...
 
 
@@ -99,6 +103,7 @@ class DockerRuntime:
     def __init__(self, settings: Settings) -> None:
         self._binary = settings.browser_docker_binary
         self._network = settings.browser_network
+        self._diagnostics_dir = settings.browser_diagnostics_dir
         self._available: bool | None = None
         self._checked_at = 0.0
 
@@ -211,6 +216,8 @@ class DockerRuntime:
                 spec.cpus,
                 "--shm-size",
                 "512m",
+                "--stop-timeout",
+                "30",
                 "--publish",
                 f"127.0.0.1::{spec.novnc_port}",
                 "--volume",
@@ -236,10 +243,13 @@ class DockerRuntime:
     async def _diagnostics(self, name: str) -> str:
         try:
             raw_state, state_error, state_code = await self._execute(
-                "inspect", "--format", "{{json .State}}", name, timeout=5
+                "inspect", "--format", "{{json .}}", name, timeout=5
             )
             if state_code == 0:
-                state_data = json.loads(raw_state)
+                inspect_data = json.loads(raw_state)
+                state_data = inspect_data.get("State") or {}
+                host_config = inspect_data.get("HostConfig") or {}
+                config = inspect_data.get("Config") or {}
                 health = state_data.get("Health")
                 state = (
                     f"status={state_data.get('Status')} "
@@ -247,12 +257,32 @@ class DockerRuntime:
                     f"exit={state_data.get('ExitCode')} "
                     f"oom_killed={state_data.get('OOMKilled')} "
                     f"error={state_data.get('Error')} "
+                    f"restart_count={inspect_data.get('RestartCount')} "
                     f"health={health.get('Status') if health else 'none'}"
+                )
+                limits = (
+                    f"memory_limit={host_config.get('Memory')} "
+                    f"shm_size={host_config.get('ShmSize')} "
+                    f"stop_timeout={config.get('StopTimeout')}"
                 )
             else:
                 state = state_error or raw_state or f"docker inspect exited {state_code}"
+                limits = "(no limits data)"
         except (BrowserUnavailable, json.JSONDecodeError, AttributeError) as exc:
             state = str(exc)
+            limits = "(no limits data)"
+
+        try:
+            events, events_error, events_code = await self._execute(
+                "exec",
+                name,
+                "cat",
+                "/sys/fs/cgroup/memory.events",
+                timeout=5,
+            )
+            cgroup = events or events_error or f"cat exited {events_code}"
+        except BrowserUnavailable as exc:
+            cgroup = str(exc)
 
         try:
             processes, processes_error, processes_code = await self._execute(
@@ -288,14 +318,56 @@ class DockerRuntime:
         except BrowserUnavailable as exc:
             logs = str(exc)
 
-        return f"state: {state}\nresources: {resources}\nprocesses:\n{processes}\nlogs:\n{logs}"
+        return (
+            f"state: {state}\n"
+            f"limits: {limits}\n"
+            f"cgroup_memory_events: {cgroup}\n"
+            f"resources: {resources}\n"
+            f"processes:\n{processes}\n"
+            f"logs:\n{logs}"
+        )
 
     async def diagnostics(self, name: str) -> str:
         return await self._diagnostics(name)
 
+    def _persist_diagnostics_sync(self, name: str, details: str, *, reason: str) -> str:
+        directory = self._diagnostics_dir
+        directory.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
+        path = directory / f"{safe_name}-{timestamp}.log"
+        path.write_text(
+            f"container: {name}\nreason: {reason}\ncaptured_at: {timestamp}\n\n{details}\n",
+            encoding="utf-8",
+        )
+        existing = sorted(
+            directory.glob("*.log"),
+            key=lambda item: (item.stat().st_mtime, item.name),
+            reverse=True,
+        )
+        for stale in existing[50:]:
+            stale.unlink(missing_ok=True)
+        return str(path)
+
+    async def persist_diagnostics(
+        self, name: str, details: str, *, reason: str
+    ) -> str | None:
+        try:
+            return await asyncio.to_thread(
+                self._persist_diagnostics_sync, name, details, reason=reason
+            )
+        except OSError:
+            logger.exception("Could not persist browser diagnostics for %s", name)
+            return None
+
     async def _report_start_failure(self, name: str, error: Exception) -> None:
         try:
             diagnostics = await self._diagnostics(name)
+            path = await self.persist_diagnostics(
+                name, diagnostics, reason=f"start failure: {error}"
+            )
+            if path is not None:
+                diagnostics = f"{diagnostics}\ndiagnostics_file: {path}"
         except Exception:
             logger.exception("Could not collect diagnostics for browser container %s", name)
             diagnostics = "diagnostics unavailable"
@@ -375,10 +447,11 @@ class DockerRuntime:
         raise BrowserUnavailable("The browser window did not start in time.")
 
     async def remove(self, name: str) -> None:
+        await self._run("stop", "--time", "30", name, timeout=45, check=False)
         await self._run("rm", "--force", name, timeout=20, check=False)
 
     async def restart(self, name: str) -> None:
-        await self._run("restart", name, timeout=30)
+        await self._run("restart", "--time", "30", name, timeout=45)
 
     async def is_running(self, name: str) -> bool:
         try:
@@ -506,6 +579,9 @@ class BrowserSessionManager:
                 if await self._runtime.is_running(existing.container):
                     existing.last_activity = self._clock()
                     return existing
+                await self._record_diagnostics(
+                    existing.container, "container exited before session reuse"
+                )
                 self._sessions.pop(existing.id, None)
                 self._by_user.pop(username, None)
 
@@ -577,18 +653,26 @@ class BrowserSessionManager:
 
     async def report_display_failure(self, session_id: str, username: str, *, reason: str) -> None:
         session = self.get(session_id, username)
-        try:
-            details = await self._runtime.diagnostics(session.container)
-        except Exception:
-            logger.exception("Could not collect display diagnostics for %s", session.container)
-            details = "diagnostics unavailable"
-        logger.error(
-            "Browser display failure for %s on port %s: %s\n%s",
+        await self._record_diagnostics(
             session.container,
-            session.port,
-            reason,
-            details,
+            f"display failure on port {session.port}: {reason}",
         )
+
+    async def _record_diagnostics(self, container: str, reason: str) -> str | None:
+        try:
+            details = await self._runtime.diagnostics(container)
+        except Exception:
+            logger.exception("Could not collect browser diagnostics for %s", container)
+            details = "diagnostics unavailable"
+        logger.error("Browser diagnostics for %s (%s):\n%s", container, reason, details)
+        try:
+            path = await self._runtime.persist_diagnostics(container, details, reason=reason)
+        except Exception:
+            logger.exception("Could not persist browser diagnostics for %s", container)
+            return None
+        if path is not None:
+            logger.error("Saved browser diagnostics for %s to %s", container, path)
+        return path
 
     async def _restart_or_recreate(self, session: BrowserSession, username: str) -> None:
         if await self._runtime.is_running(session.container):
@@ -601,6 +685,9 @@ class BrowserSessionManager:
                     "Browser container %s did not recover from restart: %s",
                     session.container,
                     exc,
+                )
+                await self._record_diagnostics(
+                    session.container, f"restart failed: {exc}"
                 )
         await self._runtime.remove(session.container)
         logger.info("Recreating browser container %s", session.container)

@@ -37,6 +37,7 @@ class FakeRuntime:
         self.ready_ports: list[int] = []
         self.ready_names: list[str] = []
         self.diagnostics_calls: list[str] = []
+        self.persisted: list[tuple[str, str]] = []
         self.fail_ready = False
 
     async def available(self) -> bool:
@@ -71,6 +72,10 @@ class FakeRuntime:
         self.diagnostics_calls.append(name)
         return "state: running oom_killed=False\nprocesses:\n1 Xvnc\n2 websockify"
 
+    async def persist_diagnostics(self, name: str, details: str, *, reason: str) -> str | None:
+        self.persisted.append((name, reason))
+        return f"/tmp/{name}.log"
+
     async def cleanup_orphans(self) -> None:
         self.cleaned = True
 
@@ -82,6 +87,7 @@ def browser_settings(settings: Settings, tmp_path: Path) -> Settings:
             "browser_enabled": True,
             "browser_users_file": tmp_path / "config" / "browser_users.json",
             "browser_state_file": tmp_path / "data" / "browser_state.json",
+            "browser_diagnostics_dir": tmp_path / "data" / "browser-diagnostics",
             "browser_secret": "test-browser-secret",
             "browser_session_ttl_hours": 12,
             "browser_idle_timeout_minutes": 1,
@@ -420,6 +426,9 @@ async def test_manager_recovers_display_and_keeps_profile_volume(
     assert recovered.port == session.port
     assert runtime.restarts == [session.container]
     assert runtime.diagnostics_calls == [session.container]
+    assert runtime.persisted == [
+        (session.container, "display failure on port 41001: noVNC asset request failed")
+    ]
     assert len(runtime.starts) == 1
     assert runtime.starts[0].volume.startswith("meridian-browser-home-")
 
@@ -535,6 +544,8 @@ def test_docker_start_reports_diagnostics_before_cleanup(
 
     run_args = next(call for call in run_calls if call[0] == "run")
     assert "--rm" not in run_args
+    assert "--stop-timeout" in run_args
+    assert run_args[run_args.index("--stop-timeout") + 1] == "30"
 
     cleanup_index = max(index for index, event in enumerate(events) if event == "run:rm")
     assert events.index("diagnostics") < cleanup_index
@@ -646,14 +657,21 @@ def test_docker_diagnostics_report_oom_processes_and_resources(
     async def fake_execute(*args: str, timeout: float = 20.0) -> tuple[str, str, int]:
         if args[0] == "inspect":
             state = {
-                "Status": "exited",
-                "Running": False,
-                "ExitCode": 137,
-                "OOMKilled": True,
-                "Error": "",
-                "Health": {"Status": "unhealthy"},
+                "State": {
+                    "Status": "exited",
+                    "Running": False,
+                    "ExitCode": 137,
+                    "OOMKilled": True,
+                    "Error": "",
+                    "Health": {"Status": "unhealthy"},
+                },
+                "HostConfig": {"Memory": 1258291200, "ShmSize": 536870912},
+                "Config": {"StopTimeout": 30},
+                "RestartCount": 2,
             }
             return json.dumps(state), "", 0
+        if args[0] == "exec":
+            return "oom 1\noom_kill 1\n", "", 0
         if args[0] == "top":
             return "PID COMMAND\n1 Xvnc\n2 websockify\n3 firefox-esr", "", 0
         if args[0] == "stats":
@@ -668,6 +686,11 @@ def test_docker_diagnostics_report_oom_processes_and_resources(
 
     assert "oom_killed=True" in diagnostics
     assert "health=unhealthy" in diagnostics
+    assert "restart_count=2" in diagnostics
+    assert "memory_limit=1258291200" in diagnostics
+    assert "shm_size=536870912" in diagnostics
+    assert "stop_timeout=30" in diagnostics
+    assert "cgroup_memory_events: oom 1" in diagnostics
     assert "memory=1.1GiB / 1.2GiB" in diagnostics
     assert "websockify" in diagnostics
     assert "Firefox content process terminated" in diagnostics
@@ -695,4 +718,84 @@ def test_firefox_policy_limits_content_processes_and_memory_pressure() -> None:
 
     assert preferences["dom.ipc.processCount"]["Value"] == 2
     assert preferences["browser.tabs.unloadOnLowMemory"]["Value"] is True
+    assert preferences["browser.tabs.warnOnClose"]["Value"] is False
     assert preferences["browser.sessionstore.resume_from_crash"]["Value"] is False
+
+
+def test_container_supervisor_shuts_down_cleanly_and_quarantines_crash_state() -> None:
+    script = (
+        Path(__file__).resolve().parents[1] / "docker" / "firefox" / "start-session.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "trap on_signal INT TERM" in script
+    assert "trap cleanup EXIT" in script
+    assert "ctrl+q" in script
+    assert "stop_child \"$FIREFOX_PID\" \"Firefox\" 10" in script
+    assert "unclean-shutdown" in script
+    assert "sessionstore.jsonlz4" in script
+    assert "sessionCheckpoints.json" in script
+    assert "sessionstore-backups" in script
+    assert "resume_from_crash" in script
+    assert "dom.ipc.processCount" in script
+    assert "memory.events" in script
+    assert "sending SIGKILL" in script
+
+
+def test_container_image_collects_crashes_and_uses_graceful_stop() -> None:
+    dockerfile = (
+        Path(__file__).resolve().parents[1] / "docker" / "firefox" / "Dockerfile"
+    ).read_text(encoding="utf-8")
+
+    assert "MOZ_CRASHREPORTER=1" in dockerfile
+    assert "MOZ_CRASHREPORTER_NO_REPORT=1" in dockerfile
+    assert "MERIDIAN_BROWSER_DIAGNOSTICS_DIR=/home/browser/.meridian/diagnostics" in dockerfile
+    assert "/home/browser/.meridian/diagnostics" in dockerfile
+    assert "STOPSIGNAL SIGTERM" in dockerfile
+
+
+def test_docker_uses_graceful_stop_and_restart_timeouts(
+    browser_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = DockerRuntime(browser_settings)
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*args: str, timeout: float = 20.0, check: bool = True) -> str:
+        calls.append(args)
+        return ""
+
+    monkeypatch.setattr(runtime, "_run", fake_run)
+
+    asyncio.run(runtime.remove("meridian-browser-test"))
+    asyncio.run(runtime.restart("meridian-browser-test"))
+
+    assert calls == [
+        ("stop", "--time", "30", "meridian-browser-test"),
+        ("rm", "--force", "meridian-browser-test"),
+        ("restart", "--time", "30", "meridian-browser-test"),
+    ]
+
+
+def test_docker_persists_diagnostics_with_rotation(
+    browser_settings: Settings,
+) -> None:
+    runtime = DockerRuntime(browser_settings)
+    diagnostics_dir = browser_settings.browser_diagnostics_dir
+    diagnostics_dir.mkdir(parents=True)
+
+    for index in range(55):
+        (diagnostics_dir / f"old-{index:02d}.log").write_text("old", encoding="utf-8")
+
+    path = asyncio.run(
+        runtime.persist_diagnostics(
+            "meridian-browser-test",
+            "state: exited oom_killed=True",
+            reason="test failure",
+        )
+    )
+
+    assert path is not None
+    contents = Path(path).read_text(encoding="utf-8")
+    assert "reason: test failure" in contents
+    assert "state: exited oom_killed=True" in contents
+    assert len(list(diagnostics_dir.glob("*.log"))) == 50

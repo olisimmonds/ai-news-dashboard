@@ -63,6 +63,7 @@ class Settings(BaseSettings):
     browser_enabled: bool = True
     browser_users_file: Path = PROJECT_ROOT / "config" / "browser_users.json"
     browser_state_file: Path = PROJECT_ROOT / "data" / "browser_state.json"
+    browser_diagnostics_dir: Path = PROJECT_ROOT / "data" / "browser-diagnostics"
     browser_secret: str | None = None
     browser_cookie_name: str = "meridian_browser"
     browser_cookie_secure: bool = False
@@ -89,6 +90,7 @@ class Settings(BaseSettings):
     def ensure_directories(self) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.browser_state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.browser_diagnostics_dir.mkdir(parents=True, exist_ok=True)
         self.browser_users_file.parent.mkdir(parents=True, exist_ok=True)
 
 

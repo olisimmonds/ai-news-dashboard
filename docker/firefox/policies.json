@@ -88,6 +88,14 @@
         "Value": true,
         "Status": "locked"
       },
+      "browser.tabs.warnOnClose": {
+        "Value": false,
+        "Status": "locked"
+      },
+      "browser.tabs.warnOnCloseOtherTabs": {
+        "Value": false,
+        "Status": "locked"
+      },
       "datareporting.policy.dataSubmissionEnabled": {
         "Value": false,
         "Status": "locked"

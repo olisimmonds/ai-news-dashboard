@@ -74,6 +74,7 @@ Settings use the `AI_DASHBOARD_` environment prefix and can also be placed in a 
 | `AI_DASHBOARD_BROWSER_ENABLED` | `true` | Enable the private remote browser |
 | `AI_DASHBOARD_BROWSER_USERS_FILE` | `config/browser_users.json` | Local browser accounts |
 | `AI_DASHBOARD_BROWSER_STATE_FILE` | `data/browser_state.json` | Per-user browser favourites |
+| `AI_DASHBOARD_BROWSER_DIAGNOSTICS_DIR` | `data/browser-diagnostics` | Persisted browser failure diagnostics |
 | `AI_DASHBOARD_BROWSER_SECRET` | generated | Cookie-signing secret |
 | `AI_DASHBOARD_BROWSER_COOKIE_SECURE` | `false` | Set true when served over HTTPS |
 | `AI_DASHBOARD_BROWSER_SESSION_TTL_HOURS` | `12` | Browser sign-in lifetime |
@@ -128,8 +129,10 @@ The private browser is deliberately separate from the news database. A phone ope
 - Idle sessions are reaped after `AI_DASHBOARD_BROWSER_IDLE_TIMEOUT_MINUTES`; at most `AI_DASHBOARD_BROWSER_MAX_SESSIONS` containers run at once.
 - Firefox force-installs uBlock Origin, blocks popups, enables tracking protection, disables telemetry, password storage and app updates.
 - Firefox is capped at two content processes and is configured not to restore tabs after a crash, reducing memory pressure on the Pi.
-- The container has a Docker health check for Xvnc, websockify and Firefox. The startup supervisor restarts a dead or unresponsive websockify/openbox process and exits the container if Xvnc or Firefox disappears.
-- Meridian retries a failed display request, then restarts the container in place when the display is genuinely stale. The named profile volume is retained.
+- The container asks Firefox to quit, then falls back to SIGTERM and a bounded wait before killing it, so a normal restart writes a clean profile. If the previous run ended uncleanly, only the session-restore files are moved aside into the profile volume; bookmarks, history, cookies, logins and favourites are kept. This prevents the Firefox "Sorry. We're having trouble getting your pages back." screen from trapping the browser after an OOM kill or forced restart.
+- Crash reporter minidumps, cgroup memory counters, process lists and session-file sizes are written under `/home/browser/.meridian/diagnostics` inside the profile volume. Meridian also saves Docker state, limits, OOM flag and logs to `data/browser-diagnostics` on the host.
+- The container has a Docker health check for Xvnc, openbox, websockify and Firefox. The startup supervisor restarts a dead or unresponsive websockify/openbox process and exits the container if Xvnc or Firefox disappears.
+- Meridian retries a failed display request, then stops and restarts the container in place when the display is genuinely stale. The named profile volume is retained.
 - There is no phone-side file transfer, host folder mount or clipboard permission granted to the embedded display. Downloads remain inside the user's browser volume.
 
 ### Limitations
@@ -234,6 +237,35 @@ docker exec --user 1000 --env XAUTHORITY=/home/browser/.Xauthority <container-na
 ```bash
 docker rm -f meridian-firefox-smoke
 ```
+
+### Apply the crash-recovery fix on the Pi
+
+```bash
+cd /home/pi/ai-news-dashboard
+git pull
+docker build -t meridian-firefox:latest docker/firefox
+sudo systemctl restart meridian
+```
+
+The existing `meridian-browser-home-*` volumes are reused. If a browser is currently stuck on the Firefox recovery page, close the session from Meridian or stop the container once; the next start quarantines the stale session files and opens a clean window without touching bookmarks or favourites.
+
+If the problem recurs, collect these files before removing any container:
+
+```bash
+journalctl -u meridian -n 300 --no-pager
+ls -lt data/browser-diagnostics/
+docker ps -a --filter label=meridian.browser.session=1 \
+  --format 'name={{.Names}} status={{.Status}} image={{.Image}}'
+docker inspect --format \
+  'exit={{.State.ExitCode}} oom={{.State.OOMKilled}} restarts={{.RestartCount}} memory={{.HostConfig.Memory}} shm={{.HostConfig.ShmSize}} stop={{.Config.StopTimeout}}' \
+  <container-name>
+docker logs --tail 200 --timestamps <container-name>
+docker exec <container-name> cat /sys/fs/cgroup/memory.events
+docker run --rm --volumes-from <container-name> --entrypoint sh meridian-firefox:latest \
+  -c 'ls -l /home/browser/.meridian/diagnostics && find /home/browser/.mozilla -maxdepth 3 \( -name "sessionstore*" -o -name sessionCheckpoints.json \) -print'
+```
+
+`oom_kill 1` or `oom=True` is evidence that the memory limit was hit; do not raise the limit without that evidence. Check the newest `data/browser-diagnostics/*.log` first because it contains the container state, limits, OOM flag, cgroup counters and logs captured before Meridian removed the container.
 
 Do not expose that port beyond localhost. Rebuild the image after changing anything under `docker/firefox`; the startup scripts are copied into the image.
 
