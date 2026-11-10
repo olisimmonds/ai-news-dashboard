@@ -134,6 +134,42 @@ describe("BrowserPage", () => {
     });
   });
 
+  it("stops automatic recovery after two failed reconnect reports", async () => {
+    mocked.getBrowserStatus.mockResolvedValue(
+      makeBrowserStatus({
+        authenticated: true,
+        user: "alice",
+        active_sessions: 1,
+        session: makeBrowserSession(),
+      }),
+    );
+    renderPage();
+
+    await screen.findByTitle("Private Firefox browser");
+    const notifyFailure = () =>
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          data: { type: "meridian-browser-reconnect-failed" },
+          origin: window.location.origin,
+        }),
+      );
+
+    notifyFailure();
+    await waitFor(() => {
+      expect(mocked.restartBrowserSession).toHaveBeenCalledTimes(1);
+    });
+    notifyFailure();
+    await waitFor(() => {
+      expect(mocked.restartBrowserSession).toHaveBeenCalledTimes(2);
+    });
+    notifyFailure();
+
+    expect(
+      await screen.findByText(/could not be recovered after 2 automatic attempts/i),
+    ).toBeVisible();
+    expect(mocked.restartBrowserSession).toHaveBeenCalledTimes(2);
+  });
+
   it("navigates and closes an active session", async () => {
     const user = userEvent.setup();
     mocked.getBrowserStatus.mockResolvedValue(

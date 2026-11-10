@@ -83,6 +83,7 @@ Settings use the `AI_DASHBOARD_` environment prefix and can also be placed in a 
 | `AI_DASHBOARD_BROWSER_IMAGE` | `meridian-firefox:latest` | Browser container image |
 | `AI_DASHBOARD_BROWSER_MEMORY_LIMIT` | `1200m` | Memory limit per Firefox container |
 | `AI_DASHBOARD_BROWSER_CPUS` | `1.5` | CPU limit per Firefox container |
+| `AI_DASHBOARD_BROWSER_PIDS_LIMIT` | `768` | Container task limit (Linux counts threads as tasks) |
 | `AI_DASHBOARD_BROWSER_COOKIE_NAME` | `meridian_browser` | Authentication cookie name |
 | `AI_DASHBOARD_SCHEDULER_ENABLED` | `true` | Enable background refresh |
 
@@ -122,18 +123,18 @@ The private browser is deliberately separate from the news database. A phone ope
 
 - Each user gets one Firefox container and one named Docker volume for the browser profile.
 - Firefox and the VNC server run as the unprivileged `browser` user inside the container.
-- Containers use a private Docker network, no host filesystem mounts other than the profile volume, `no-new-privileges`, all capabilities dropped except the minimum needed to prepare the profile and drop privileges, PID/memory/CPU limits and a localhost-only published port.
+- Containers use a private Docker network, no host filesystem mounts other than the profile volume, `no-new-privileges`, all capabilities dropped except the minimum needed to prepare the profile and drop privileges, task/memory/CPU limits and a localhost-only published port. Docker's pids limit counts threads as well as processes, so the default is 768 tasks per Firefox container.
 - Meridian's database, source configuration and the rest of the home directory are not mounted into the browser.
 - noVNC is served on a separate container port. Meridian proxies it after authentication; the host mapping is bound only to `127.0.0.1` on a random port and is never exposed on the network.
 - Browser accounts use scrypt password hashes. Sessions use signed, HttpOnly cookies and are closed on sign-out.
 - Idle sessions are reaped after `AI_DASHBOARD_BROWSER_IDLE_TIMEOUT_MINUTES`; at most `AI_DASHBOARD_BROWSER_MAX_SESSIONS` containers run at once.
 - Firefox force-installs uBlock Origin, blocks popups, enables tracking protection, disables telemetry, password storage and app updates.
-- Firefox is capped at two content processes, configured not to restore tabs after a crash, and has its fork server disabled (`dom.ipc.forkserver.enable=false`) as a workaround for the Firefox 153.5/153.6 ESR content-process crash reports. The sandbox and site isolation stay enabled; this is not a security downgrade.
+- Firefox is capped at two web-content processes, with file, extension, privileged-about, privileged-Mozilla, per-site and service-worker process counts held at one. It is configured not to restore tabs after a crash and has its fork server disabled (`dom.ipc.forkserver.enable=false`). The sandbox and site isolation stay enabled; this is not a security downgrade. The fork-server change is a secondary workaround and is not evidence that the pids/thread limit is no longer needed.
 - The container asks Firefox to quit, then falls back to SIGTERM and a bounded wait before killing it, so a normal restart writes a clean profile. If the previous run ended uncleanly, only the session-restore files are moved aside into the profile volume; bookmarks, history, cookies, logins and favourites are kept. This prevents the Firefox "Sorry. We're having trouble getting your pages back." screen from trapping the browser after an OOM kill or forced restart.
-- The container includes a Meridian noVNC page that reconnects automatically after a display WebSocket drops, then asks Meridian to restart the display if reconnection keeps failing. The proxy logs client and upstream close codes so the next disconnect has a recorded cause.
-- Crash reporter minidumps, their `.extra` annotation files, cgroup memory counters, process lists and session-file sizes are written under `/home/browser/.meridian/diagnostics` inside the profile volume. The supervisor also records the installed Firefox package version and samples process command lines every five seconds. Meridian copies the diagnostics directory to `data/browser-diagnostics/artifacts` on the host and saves Docker state, limits, OOM flag and logs to `data/browser-diagnostics` before removing the container, including when a container exits while a session is still active.
+- The container includes a Meridian noVNC page that makes two reconnection attempts after a display WebSocket drops, then asks Meridian to restart the display. Meridian also allows at most two automatic container recoveries per session; after that it stops and asks for a manual restart instead of recreating containers indefinitely. The proxy logs client and upstream close codes so the next disconnect has a recorded cause.
+- Crash reporter minidumps, their `.extra` annotation files, cgroup memory/pids counters, per-process thread counts and session-file sizes are written under `/home/browser/.meridian/diagnostics` inside the profile volume. The supervisor records the installed Firefox package version, the kernel command line and cgroup controllers, and samples `ps` output with `nlwp`, total tasks and `pids.events` every five seconds. Meridian copies the diagnostics directory to `data/browser-diagnostics/artifacts` on the host and saves Docker state, limits, OOM flag and logs to `data/browser-diagnostics` before removing the container, including when a container exits while a session is still active.
 - The container has a Docker health check for Xvnc, openbox, websockify and Firefox. The startup supervisor restarts a dead or unresponsive websockify/openbox process and exits the container if Xvnc or Firefox disappears.
-- Meridian retries a failed display request, then stops and restarts the container in place when the display is genuinely stale. The named profile volume is retained.
+- Meridian retries a failed display request, then stops and restarts the container in place when the display is genuinely stale. The named profile volume is retained, and stale Docker network endpoints are disconnected before a container is recreated.
 - There is no phone-side file transfer, host folder mount or clipboard permission granted to the embedded display. Downloads remain inside the user's browser volume.
 
 ### Limitations
@@ -143,7 +144,7 @@ The private browser is deliberately separate from the news database. A phone ope
 - Access to the Docker socket is effectively root-equivalent on the Pi. Only the Meridian service account should hold that permission.
 - A local process on the Pi that can reach loopback can connect to a running container's random VNC port and bypass Meridian's login. Treat shell access to the Pi as trusted.
 - Remote rendering is functional, not native. Video, audio, high-DPI scrolling and some keyboard shortcuts may behave differently from a local browser.
-- Each Firefox container defaults to 1.2 GB and 1.5 CPUs. Two sessions plus Meridian and the operating system fit a 4 GB Pi 4, but leave little headroom. If `AI_DASHBOARD_BROWSER_MEMORY_LIMIT` is explicitly set in `.env`, that value overrides the default.
+- Each Firefox container defaults to 1.2 GB, 1.5 CPUs and 768 tasks. Two sessions plus Meridian and the operating system fit a 4 GB Pi 4, but leave little headroom. If `AI_DASHBOARD_BROWSER_MEMORY_LIMIT` or `AI_DASHBOARD_BROWSER_PIDS_LIMIT` is explicitly set in `.env`, that value overrides the default.
 - Browser profiles persist in named Docker volumes. Delete the relevant `meridian-browser-home-*` volume to reset a profile.
 
 ### Install on the Raspberry Pi
@@ -243,22 +244,58 @@ docker exec --user 1000 --env XAUTHORITY=/home/browser/.Xauthority <container-na
 docker rm -f meridian-firefox-smoke
 ```
 
-### Firefox SIGSEGV evidence
+### Firefox crash evidence and pids/thread exhaustion
 
-The Pi logs show Firefox content processes exiting with signal 11 (`SIGSEGV`) and the container exiting `245`. Exit `245` is `EXIT_CODE_CONTENT_CRASHED`: the image sets `MOZ_CRASHREPORTER_SHUTDOWN=1`, so Firefox force-quits after the first content-process crash. It is a consequence of the crash, not a separate failure.
+The 10 November crash at 18:46 UTC produced three minidumps. Their `.extra` files report:
 
-The current image disables Firefox's fork server (`dom.ipc.forkserver.enable=false`) as a targeted workaround for reports against Firefox 153.5/153.6 ESR. This is a workaround, not a confirmed root-cause fix. Verify it on the Pi with the stability test before treating the problem as resolved.
+- `MOZ_CRASH(Failed to create IPC I/O Thread)`
+- `MOZ_CRASH(nsThreadPool::PutEvent() - Failed to create a new thread when pool is empty)`
+- `ThreadLastCreateError` OS error `0xb` (`EAGAIN`)
 
-Capture the exact versions before changing anything:
+One crashed process had `RemoteType=webServiceWorker`; content sandboxing was enabled. The kernel log recorded `cgroup: fork rejected by pids controller` for the container. The container was running with `--pids-limit 256`, the host was not out of memory, and `OOMKilled=false`.
+
+Linux pids controllers count tasks, so every thread consumes one slot. Firefox's parent process, web-content processes, service workers, GPU/RDD/socket/utility processes, Xvnc, openbox and websockify can exceed 256 tasks even when only a handful of PIDs are visible. The default limit is now 768 and configurable with `AI_DASHBOARD_BROWSER_PIDS_LIMIT`. This does not change the sandbox or site isolation; it still bounds runaway thread/process creation, and `AI_DASHBOARD_BROWSER_MAX_SESSIONS` bounds the number of containers. Raise it further only with `pids.current`/`pids.events` evidence that legitimate Firefox threads are still hitting the limit.
+
+Exit `245` is `EXIT_CODE_CONTENT_CRASHED`: the image sets `MOZ_CRASHREPORTER_SHUTDOWN=1`, so Firefox force-quits after a content-process crash. It is a consequence of the crash, not a separate failure.
+
+The image also disables Firefox's fork server (`dom.ipc.forkserver.enable=false`). That remains a secondary workaround, not evidence that pids/thread exhaustion is solved.
+
+Capture the exact limits and thread counts before changing anything:
 
 ```bash
 docker exec <container-name> firefox-esr --version
 docker exec <container-name> dpkg-query -W -f='${Version}\n' firefox-esr
-docker inspect --format 'memory={{.HostConfig.Memory}} shm={{.HostConfig.ShmSize}}' <container-name>
-docker exec <container-name> sh -c 'for f in memory.events memory.max memory.current; do echo "$f:"; cat /sys/fs/cgroup/$f; done'
+docker inspect --format 'pids={{.HostConfig.PidsLimit}} memory={{.HostConfig.Memory}} shm={{.HostConfig.ShmSize}}' <container-name>
+docker info --format 'cgroup={{.CgroupDriver}}/{{.CgroupVersion}} memory_limit={{.MemoryLimit}} pids_limit={{.PidsLimit}}'
+docker exec <container-name> sh -c '
+  for f in pids.current pids.max pids.events memory.events memory.max memory.current; do
+    if [ -e "/sys/fs/cgroup/$f" ]; then echo "$f:"; cat "/sys/fs/cgroup/$f"; fi
+    if [ -e "/sys/fs/cgroup/pids/$f" ]; then echo "pids/$f:"; cat "/sys/fs/cgroup/pids/$f"; fi
+  done'
+docker top <container-name> -eo pid,ppid,nlwp,stat,comm,args
 ```
 
-`HostConfig.Memory=0` with a non-zero cgroup `memory.max` means Docker reported no host-level limit while the cgroup still enforces one. Meridian diagnostics now include both `configured_memory_limit` (from `AI_DASHBOARD_BROWSER_MEMORY_LIMIT`) and the cgroup values so this can be checked directly. `1200m` must be `1258291200` bytes.
+The correct crash archive file is `process-samples-tail.log`, not `process-samples.log`. It contains the last samples before the crash because the live thread count can drop as soon as processes exit. Sum the `nlwp` column for thread pressure. `thread-summary.txt` records the cgroup `pids.current`, `pids.max` and `pids.events` at capture time. A rising `nlwp` with few processes points to thread exhaustion; many processes with low `nlwp` points to a process leak. `pids.events` with `max` greater than zero means the kernel actually rejected a fork.
+
+On a working Docker setup, `HostConfig.Memory` is `1258291200` and the container's `memory.max` matches. If `HostConfig.Memory` is set but `memory.max` is missing, the host memory cgroup controller is not enabled and Docker is not enforcing the limit. Meridian diagnostics now record `docker_info`, the host `proc_cmdline`, cgroup type/controllers, and both cgroup v2 paths and v1 fallbacks for memory and pids.
+
+### Docker memory limits on Raspberry Pi OS
+
+The Pi accepted `--memory` but did not enforce it because the running kernel had the memory cgroup controller disabled. On stock Raspberry Pi OS this happens when the firmware injects `cgroup_disable=memory` into the kernel command line. Docker can still start the container and `HostConfig.Memory` is non-zero, but the container has no `memory.max` file, so the limit has no effect.
+
+Check the actual host and container configuration:
+
+```bash
+cat /proc/cmdline
+cat /sys/fs/cgroup/cgroup.controllers
+docker info --format 'cgroup={{.CgroupDriver}}/{{.CgroupVersion}} memory_limit={{.MemoryLimit}} pids_limit={{.PidsLimit}}'
+docker inspect --format 'memory={{.HostConfig.Memory}} pids={{.HostConfig.PidsLimit}}' <container-name>
+docker exec <container-name> sh -c 'cat /sys/fs/cgroup/memory.max; cat /sys/fs/cgroup/memory.current'
+```
+
+Expected: `/proc/cmdline` does **not** contain `cgroup_disable=memory`, `cgroup.controllers` includes `memory`, Docker reports `memory_limit=true`, and the container's `memory.max` is `1258291200`. The pids controller is separate from the memory controller; the `fork rejected by pids controller` message proves pids enforcement was working.
+
+A safe remediation is to back up `/boot/firmware/cmdline.txt`, add `cgroup_enable=memory cgroup_memory=1` to the existing single line (do not create extra lines), reboot, and re-run the checks above. Do not change the boot command line without evidence and a backup; an incorrect edit can prevent the Pi from booting. This repository does not modify host boot configuration automatically.
 
 Minidumps (`.dmp`) and their `.extra` annotation files are under the selected profile's `minidumps/` directory. The supervisor copies them into `<profile-volume>/.meridian/diagnostics/crash-*` as soon as Firefox exits non-zero and Meridian exports the diagnostics directory to `data/browser-diagnostics/artifacts/` before removing the container. Check the host too:
 
@@ -271,7 +308,7 @@ sudo dmesg -T | grep -Ei 'segfault|oom|killed process|firefox'
 
 If no `.dmp` exists, say so explicitly: the crash evidence is incomplete and the fix is unverified.
 
-### Apply the crash-recovery and SIGSEGV fixes on the Pi
+### Apply the browser stability fixes on the Pi
 
 ```bash
 cd /home/pi/ai-news-dashboard
@@ -296,7 +333,7 @@ chmod +x scripts/browser-stability-test.sh
 scripts/browser-stability-test.sh --build --matrix
 ```
 
-Each run preserves `container.log`, `inspect.json`, `top.txt`, `diagnostics/` and any minidumps under `data/browser-stability/`. The script fails a run when the container exits early, a minidump appears, crash text appears in the log, or the memory limit does not match `1258291200` bytes. Change one variable at a time when narrowing a failure; do not use a single test site as proof that the crash is fixed.
+Each run preserves `container.log`, `inspect.json`, `top.txt`, `diagnostics/` and any minidumps under `data/browser-stability/`. The script runs with the same 768-task default and fails a run when the container exits early, a minidump appears, crash text appears in the log, the memory limit does not match `1258291200` bytes, or the pids limit does not match `768`. It records `pids.current`, `pids.max`, `pids.events` and total threads at the end of a timed run. Override `PIDS_LIMIT` and `EXPECTED_PIDS_LIMIT` together if testing a different limit. Change one variable at a time when narrowing a failure; do not use a single test site as proof that the crash is fixed.
 
 The existing `meridian-browser-home-*` volumes are reused. The supervisor records the selected Firefox profile in `.meridian/diagnostics/profile-path` and launches Firefox with `--profile`, so crash cleanup always targets the profile Firefox actually used. If a browser is currently stuck on the Firefox recovery page, close the session from Meridian or stop the container once; the next start quarantines the stale session files and opens a clean window without touching bookmarks or favourites.
 
@@ -308,15 +345,16 @@ ls -lt data/browser-diagnostics/
 docker ps -a --filter label=meridian.browser.session=1 \
   --format 'name={{.Names}} status={{.Status}} image={{.Image}}'
 docker inspect --format \
-  'exit={{.State.ExitCode}} oom={{.State.OOMKilled}} restarts={{.RestartCount}} memory={{.HostConfig.Memory}} shm={{.HostConfig.ShmSize}} stop={{.Config.StopTimeout}}' \
+  'exit={{.State.ExitCode}} oom={{.State.OOMKilled}} restarts={{.RestartCount}} memory={{.HostConfig.Memory}} pids={{.HostConfig.PidsLimit}} shm={{.HostConfig.ShmSize}} stop={{.Config.StopTimeout}}' \
   <container-name>
 docker logs --tail 200 --timestamps <container-name>
-docker exec <container-name> cat /sys/fs/cgroup/memory.events
+docker exec <container-name> sh -c 'cat /sys/fs/cgroup/memory.events; cat /sys/fs/cgroup/pids.events; cat /sys/fs/cgroup/pids.current; cat /sys/fs/cgroup/pids.max'
+docker top <container-name> -eo pid,ppid,nlwp,stat,comm,args
 docker run --rm --volumes-from <container-name> --entrypoint sh meridian-firefox:latest \
   -c 'ls -l /home/browser/.meridian/diagnostics && find /home/browser/.mozilla -maxdepth 3 \( -name "sessionstore*" -o -name sessionCheckpoints.json \) -print'
 ```
 
-`oom_kill 1` or `oom=True` is evidence that the memory limit was hit; do not raise the limit without that evidence. Check the newest `data/browser-diagnostics/*.log` first because it contains the container state, limits, OOM flag, cgroup counters and logs captured before Meridian removed the container.
+`oom_kill 1` or `oom=True` is evidence that the memory limit was hit; do not raise the limit without that evidence. `pids.events` with `max` greater than zero, or a pre-crash `pids.current` close to `pids.max`, is evidence of task/thread exhaustion. Each extra task consumes kernel memory even though its stack is mostly virtual, so raise the pids limit only enough to leave realistic headroom. Check the newest `data/browser-diagnostics/*.log` first because it contains the container state, limits, OOM flag, cgroup counters, thread counts and logs captured before Meridian removed the container. After two automatic display recoveries, Meridian stops recreating the container and requires a manual restart.
 
 Do not expose that port beyond localhost. Rebuild the image after changing anything under `docker/firefox`; the startup scripts are copied into the image.
 

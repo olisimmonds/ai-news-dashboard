@@ -78,6 +78,7 @@ class Settings(BaseSettings):
     browser_novnc_port: int = Field(default=6080, ge=1024, le=65535)
     browser_memory_limit: str = "1200m"
     browser_cpus: str = "1.5"
+    browser_pids_limit: int = Field(default=768, ge=64, le=4096)
     browser_docker_binary: str = "docker"
 
     scheduler_enabled: bool = True

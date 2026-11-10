@@ -38,13 +38,14 @@
     <script type="module" crossorigin="anonymous">
         import RFB from './core/rfb.js';
 
-        const MAX_RECONNECT_ATTEMPTS = 12;
+        const MAX_RECONNECT_ATTEMPTS = 2;
         const STABLE_CONNECTION_MS = 15000;
 
         let rfb = null;
         let desktopName = "";
         let reconnectAttempts = 0;
         let reconnectTimer = null;
+        let reconnectExhausted = false;
         let connectedAt = 0;
 
         function status(text) {
@@ -84,10 +85,14 @@
         url += '/' + path;
 
         function scheduleReconnect(reason) {
-            if (reconnectTimer) return;
+            if (reconnectTimer || reconnectExhausted) return;
             if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-                status("Connection lost. Select Reconnect display.");
-                notifyParent("meridian-browser-reconnect-failed", { reason });
+                reconnectExhausted = true;
+                status(`Connection lost after ${MAX_RECONNECT_ATTEMPTS} attempts. Select Reconnect display.`);
+                notifyParent("meridian-browser-reconnect-failed", {
+                    reason,
+                    attempts: MAX_RECONNECT_ATTEMPTS,
+                });
                 return;
             }
             const delay = Math.min(1000 * (2 ** reconnectAttempts), 8000);
@@ -128,6 +133,7 @@
 
             rfb.addEventListener("connect", () => {
                 connectedAt = Date.now();
+                reconnectExhausted = false;
                 status("Connected to " + (desktopName || "Firefox"));
                 notifyParent("meridian-browser-connected", {});
             });

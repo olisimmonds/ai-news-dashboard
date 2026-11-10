@@ -8,6 +8,9 @@ INTERVAL="${INTERVAL:-30}"
 MEMORY="${MEMORY:-1200m}"
 EXPECTED_MEMORY_BYTES="${EXPECTED_MEMORY_BYTES:-1258291200}"
 CPUS="${CPUS:-1.5}"
+PIDS_LIMIT="${PIDS_LIMIT:-768}"
+EXPECTED_PIDS_LIMIT="${EXPECTED_PIDS_LIMIT:-$PIDS_LIMIT}"
+STRICT_PIDS="${STRICT_PIDS:-1}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/data/browser-stability}"
 NETWORK="${NETWORK:-meridian-browser-test}"
 VOLUME_PREFIX="${VOLUME_PREFIX:-meridian-stability-home}"
@@ -44,8 +47,9 @@ Options:
   --keep                Keep the container and volume after the run
   --help                Show this help
 
-Environment overrides: MEMORY, EXPECTED_MEMORY_BYTES, CPUS, NETWORK,
-BBC_URL, OTHER_URL, STRICT_MEMORY=0.
+Environment overrides: MEMORY, EXPECTED_MEMORY_BYTES, CPUS, PIDS_LIMIT,
+EXPECTED_PIDS_LIMIT, NETWORK, BBC_URL, OTHER_URL, STRICT_MEMORY=0,
+STRICT_PIDS=0.
 USAGE
 }
 
@@ -201,7 +205,8 @@ run_scenario() {
     local site="$2"
     local run_id volume container url out started_at now elapsed running
     local timed_out exit_code window profile_path minidumps crash_markers
-    local host_memory cgroup_max status notes window_found navigation_failed
+    local host_memory cgroup_max host_pids cgroup_pids_max cgroup_pids_current
+    local pids_events thread_total status notes window_found navigation_failed
 
     run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$-${RANDOM}"
     volume="$(profile_volume "$profile" "$run_id")"
@@ -224,7 +229,7 @@ run_scenario() {
         --cap-add DAC_OVERRIDE \
         --cap-add SETUID \
         --cap-add SETGID \
-        --pids-limit 256 \
+        --pids-limit "$PIDS_LIMIT" \
         --memory "$MEMORY" \
         --cpus "$CPUS" \
         --shm-size 512m \
@@ -263,10 +268,27 @@ run_scenario() {
 
     if [ "$timed_out" -eq 1 ]; then
         cgroup_max="$(docker exec "$container" cat /sys/fs/cgroup/memory.max 2>/dev/null || true)"
+        cgroup_pids_max="$(docker exec "$container" sh -c \
+            'cat /sys/fs/cgroup/pids.max 2>/dev/null || cat /sys/fs/cgroup/pids/pids.max 2>/dev/null' \
+            2>/dev/null || true)"
+        cgroup_pids_current="$(docker exec "$container" sh -c \
+            'cat /sys/fs/cgroup/pids.current 2>/dev/null || cat /sys/fs/cgroup/pids/pids.current 2>/dev/null' \
+            2>/dev/null || true)"
+        pids_events="$(docker exec "$container" sh -c \
+            'cat /sys/fs/cgroup/pids.events 2>/dev/null || cat /sys/fs/cgroup/pids/pids.events 2>/dev/null' \
+            2>/dev/null || true)"
+        thread_total="$(docker exec "$container" sh -c \
+            'ps -eLo tid= 2>/dev/null | wc -l' 2>/dev/null || true)"
     else
         cgroup_max=""
+        cgroup_pids_max=""
+        cgroup_pids_current=""
+        pids_events=""
+        thread_total=""
     fi
+    [ -n "$thread_total" ] || thread_total=unknown
     host_memory="$(docker inspect -f '{{.HostConfig.Memory}}' "$container" 2>/dev/null || printf 'unknown\n')"
+    host_pids="$(docker inspect -f '{{.HostConfig.PidsLimit}}' "$container" 2>/dev/null || printf 'unknown\n')"
 
     if [ "$timed_out" -eq 1 ]; then
         docker stop --time 30 "$container" >/dev/null 2>&1 || true
@@ -318,6 +340,10 @@ run_scenario() {
         status=FAIL
         notes="${notes}memory=${host_memory};"
     fi
+    if [ "$STRICT_PIDS" = "1" ] && [ "$host_pids" != "$EXPECTED_PIDS_LIMIT" ]; then
+        status=FAIL
+        notes="${notes}pids-limit=${host_pids};"
+    fi
 
     {
         printf 'profile=%s\nsite=%s\nurl=%s\nimage=%s\n' \
@@ -326,6 +352,9 @@ run_scenario() {
             "$DURATION" "$elapsed" "$timed_out" "$exit_code"
         printf 'host_memory=%s\nexpected_memory=%s\ncgroup_memory_max=%s\n' \
             "$host_memory" "$EXPECTED_MEMORY_BYTES" "$cgroup_max"
+        printf 'host_pids=%s\nexpected_pids=%s\ncgroup_pids_max=%s\ncgroup_pids_current=%s\n' \
+            "$host_pids" "$EXPECTED_PIDS_LIMIT" "$cgroup_pids_max" "$cgroup_pids_current"
+        printf 'pids_events=%s\nthread_total=%s\n' "$pids_events" "$thread_total"
         printf 'minidumps=%s\ncrash_markers=%s\nstatus=%s\nnotes=%s\n' \
             "$minidumps" "$crash_markers" "$status" "$notes"
     } > "$out/summary.txt"

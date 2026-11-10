@@ -27,6 +27,7 @@ import {
 import type { BrowserAction, BrowserFavourite, BrowserSession, BrowserStatus } from "../lib/types";
 
 const HOME_URL = "https://duckduckgo.com/";
+const MAX_AUTO_RECOVERIES = 2;
 
 type BusyState = "login" | "logout" | "start" | "navigate" | "action" | "restart" | "close" | null;
 
@@ -128,7 +129,8 @@ export function BrowserPage() {
   const [frameKey, setFrameKey] = useState(0);
   const frameRef = useRef<HTMLDivElement>(null);
   const restartRef = useRef<() => void>(() => undefined);
-  const autoRecoveryRef = useRef(false);
+  const autoRecoveryAttemptsRef = useRef(0);
+  const autoRecoveryInFlightRef = useRef(false);
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
@@ -162,33 +164,13 @@ export function BrowserPage() {
     return () => controller.abort();
   }, [load]);
 
-  useLayoutEffect(() => {
-    restartRef.current = () => void restart();
-  });
-
-  useEffect(() => {
-    function handleDisplayMessage(event: MessageEvent) {
-      if (event.origin !== window.location.origin) return;
-      const data = event.data as { type?: unknown } | null;
-      if (data?.type !== "meridian-browser-reconnect-failed" || autoRecoveryRef.current) {
-        return;
-      }
-      autoRecoveryRef.current = true;
-      restartRef.current();
-      window.setTimeout(() => {
-        autoRecoveryRef.current = false;
-      }, 30000);
-    }
-
-    window.addEventListener("message", handleDisplayMessage);
-    return () => window.removeEventListener("message", handleDisplayMessage);
-  }, []);
-
   function updateSession(session: BrowserSession) {
     setStatus((current) => (current ? { ...current, session } : current));
   }
 
   function resetSession(message: string | null) {
+    autoRecoveryAttemptsRef.current = 0;
+    autoRecoveryInFlightRef.current = false;
     setStatus((current) =>
       current
         ? {
@@ -207,6 +189,8 @@ export function BrowserPage() {
     setActionError(null);
     try {
       await loginBrowser(username, password);
+      autoRecoveryAttemptsRef.current = 0;
+      autoRecoveryInFlightRef.current = false;
       await load();
     } catch (cause) {
       setActionError(messageOf(cause, "Could not sign in."));
@@ -224,6 +208,8 @@ export function BrowserPage() {
         await closeBrowserSession(session.id).catch(() => undefined);
       }
       await logoutBrowser();
+      autoRecoveryAttemptsRef.current = 0;
+      autoRecoveryInFlightRef.current = false;
       await load();
     } catch (cause) {
       setActionError(messageOf(cause, "Could not sign out."));
@@ -237,6 +223,8 @@ export function BrowserPage() {
     setActionError(null);
     try {
       const session = await startBrowserSession(target?.trim() || undefined);
+      autoRecoveryAttemptsRef.current = 0;
+      autoRecoveryInFlightRef.current = false;
       setStatus((current) =>
         current
           ? {
@@ -294,9 +282,15 @@ export function BrowserPage() {
     }
   }
 
-  async function restart() {
+  async function restart(automatic = false) {
     const session = status?.session;
-    if (!session) return;
+    if (!session) {
+      autoRecoveryInFlightRef.current = false;
+      return;
+    }
+    if (!automatic) {
+      autoRecoveryAttemptsRef.current = 0;
+    }
     setBusy("restart");
     setActionError(null);
     try {
@@ -309,9 +303,35 @@ export function BrowserPage() {
         setActionError(messageOf(cause, "Could not restart the browser."));
       }
     } finally {
+      autoRecoveryInFlightRef.current = false;
       setBusy(null);
     }
   }
+
+  useLayoutEffect(() => {
+    restartRef.current = () => void restart(true);
+  });
+
+  useEffect(() => {
+    function handleDisplayMessage(event: MessageEvent) {
+      if (event.origin !== window.location.origin) return;
+      const data = event.data as { type?: unknown } | null;
+      if (data?.type !== "meridian-browser-reconnect-failed") return;
+      if (autoRecoveryInFlightRef.current) return;
+      if (autoRecoveryAttemptsRef.current >= MAX_AUTO_RECOVERIES) {
+        setActionError(
+          `The browser display could not be recovered after ${MAX_AUTO_RECOVERIES} automatic attempts. Close the session and start a new one.`,
+        );
+        return;
+      }
+      autoRecoveryInFlightRef.current = true;
+      autoRecoveryAttemptsRef.current += 1;
+      restartRef.current();
+    }
+
+    window.addEventListener("message", handleDisplayMessage);
+    return () => window.removeEventListener("message", handleDisplayMessage);
+  }, []);
 
   async function close() {
     const session = status?.session;
@@ -320,6 +340,8 @@ export function BrowserPage() {
     setActionError(null);
     try {
       await closeBrowserSession(session.id);
+      autoRecoveryAttemptsRef.current = 0;
+      autoRecoveryInFlightRef.current = false;
       setStatus((current) =>
         current
           ? {

@@ -31,6 +31,7 @@ _WINDOW_SEARCH = (
 _BROWSER_UID = "1000"
 _BROWSER_XAUTHORITY = "/home/browser/.Xauthority"
 _DISPLAY_RECOVERY_COOLDOWN_SECONDS = 15.0
+_DISPLAY_RECOVERY_MAX_ATTEMPTS = 2
 _SESSION_MONITOR_INTERVAL_SECONDS = 5.0
 
 
@@ -77,6 +78,7 @@ class ContainerSpec:
     novnc_port: int
     memory: str
     cpus: str
+    pids_limit: int
 
 
 class BrowserRuntime(Protocol):
@@ -105,8 +107,10 @@ class DockerRuntime:
     def __init__(self, settings: Settings) -> None:
         self._binary = settings.browser_docker_binary
         self._network = settings.browser_network
+        self._container_prefix = settings.browser_container_prefix
         self._diagnostics_dir = settings.browser_diagnostics_dir
         self._memory_limit = settings.browser_memory_limit
+        self._pids_limit = settings.browser_pids_limit
         self._available: bool | None = None
         self._checked_at = 0.0
 
@@ -212,7 +216,7 @@ class DockerRuntime:
                 "--cap-add",
                 "SETGID",
                 "--pids-limit",
-                "256",
+                str(spec.pids_limit),
                 "--memory",
                 spec.memory,
                 "--cpus",
@@ -266,6 +270,9 @@ class DockerRuntime:
                 limits = (
                     f"memory_limit={host_config.get('Memory')} "
                     f"configured_memory_limit={self._memory_limit} "
+                    f"pids_limit={host_config.get('PidsLimit')} "
+                    f"configured_pids_limit={self._pids_limit} "
+                    f"memory_swap={host_config.get('MemorySwap')} "
                     f"shm_size={host_config.get('ShmSize')} "
                     f"stop_timeout={config.get('StopTimeout')}"
                 )
@@ -277,11 +284,49 @@ class DockerRuntime:
             limits = "(no limits data)"
 
         try:
+            info_raw, info_error, info_code = await self._execute(
+                "info", "--format", "{{json .}}", timeout=5
+            )
+            if info_code == 0 and info_raw:
+                info = json.loads(info_raw)
+                warnings = "; ".join(str(item) for item in (info.get("Warnings") or []))
+                docker_info = (
+                    f"cgroup_driver={info.get('CgroupDriver')} "
+                    f"cgroup_version={info.get('CgroupVersion')} "
+                    f"memory_limit_support={info.get('MemoryLimit')} "
+                    f"swap_limit_support={info.get('SwapLimit')} "
+                    f"pids_limit_support={info.get('PidsLimit')} "
+                    f"server_version={info.get('ServerVersion')} "
+                    f"warnings={warnings or 'none'}"
+                )
+            else:
+                docker_info = info_error or info_raw or f"docker info exited {info_code}"
+        except (BrowserUnavailable, json.JSONDecodeError, AttributeError) as exc:
+            docker_info = str(exc)
+
+        try:
             cgroup_script = (
-                "for name in memory.events memory.max memory.current "
-                "memory.swap.current pids.current pids.max; do "
-                "printf '%s:\\n' \"$name\"; "
-                'cat "/sys/fs/cgroup/$name" 2>/dev/null || true; '
+                "printf 'cgroup_type:%s\\n' \"$(stat -fc %T /sys/fs/cgroup 2>/dev/null || true)\"; "
+                "printf 'cgroup_controllers:%s\\n' "
+                '"$(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null || true)"; '
+                "printf 'proc_cmdline:%s\\n' \"$(cat /proc/cmdline 2>/dev/null || true)\"; "
+                "for path in "
+                "/sys/fs/cgroup/memory.events "
+                "/sys/fs/cgroup/memory.max "
+                "/sys/fs/cgroup/memory.current "
+                "/sys/fs/cgroup/memory.swap.current "
+                "/sys/fs/cgroup/memory.peak "
+                "/sys/fs/cgroup/pids.current "
+                "/sys/fs/cgroup/pids.max "
+                "/sys/fs/cgroup/pids.events "
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes "
+                "/sys/fs/cgroup/memory/memory.usage_in_bytes "
+                "/sys/fs/cgroup/pids/pids.current "
+                "/sys/fs/cgroup/pids/pids.max; do "
+                'if [ -e "$path" ]; then '
+                "printf '%s:\\n' \"$path\"; "
+                "sed 's/^/  /' \"$path\" 2>/dev/null || true; "
+                "else printf '%s: (not present)\\n' \"$path\"; fi; "
                 "done"
             )
             events, events_error, events_code = await self._execute(
@@ -298,7 +343,7 @@ class DockerRuntime:
 
         try:
             processes, processes_error, processes_code = await self._execute(
-                "top", name, "-eo", "pid,comm,args", timeout=5
+                "top", name, "-eo", "pid,ppid,nlwp,stat,comm,args", timeout=5
             )
             processes = (
                 "\n".join(part for part in (processes, processes_error) if part)
@@ -312,7 +357,7 @@ class DockerRuntime:
                 "stats",
                 "--no-stream",
                 "--format",
-                "memory={{.MemUsage}} cpu={{.CPUPerc}}",
+                "memory={{.MemUsage}} cpu={{.CPUPerc}} pids={{.PIDs}}",
                 name,
                 timeout=5,
             )
@@ -333,7 +378,8 @@ class DockerRuntime:
         return (
             f"state: {state}\n"
             f"limits: {limits}\n"
-            f"cgroup_memory_events: {cgroup}\n"
+            f"docker_info: {docker_info}\n"
+            f"cgroup: {cgroup}\n"
             f"resources: {resources}\n"
             f"processes:\n{processes}\n"
             f"logs:\n{logs}"
@@ -487,7 +533,19 @@ class DockerRuntime:
         logger.error("Firefox window not ready in %s: %s", name, window_error)
         raise BrowserUnavailable("The browser window did not start in time.")
 
+    async def _disconnect_endpoint(self, name: str) -> None:
+        await self._run(
+            "network",
+            "disconnect",
+            "--force",
+            self._network,
+            name,
+            timeout=10,
+            check=False,
+        )
+
     async def remove(self, name: str) -> None:
+        await self._disconnect_endpoint(name)
         await self._run("stop", "--time", "30", name, timeout=45, check=False)
         await self._run("rm", "--force", name, timeout=20, check=False)
 
@@ -515,6 +573,35 @@ class DockerRuntime:
             timeout=15,
         )
 
+    async def _cleanup_stale_network_endpoints(self) -> None:
+        raw = await self._run(
+            "network",
+            "inspect",
+            "--format",
+            "{{json .Containers}}",
+            self._network,
+            timeout=10,
+            check=False,
+        )
+        if not raw:
+            return
+        try:
+            endpoints = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("Could not parse Docker network endpoints for %s", self._network)
+            return
+        if not isinstance(endpoints, dict):
+            return
+        for endpoint in endpoints.values():
+            name = str((endpoint or {}).get("Name") or "")
+            if not name.startswith(f"{self._container_prefix}-"):
+                continue
+            _stdout, _stderr, returncode = await self._execute("inspect", name, timeout=5)
+            if returncode == 0:
+                continue
+            logger.info("Disconnecting stale browser network endpoint %s", name)
+            await self._disconnect_endpoint(name)
+
     async def cleanup_orphans(self) -> None:
         output = await self._run(
             "ps", "--all", "--quiet", "--filter", "label=meridian.browser.session=1", timeout=10
@@ -522,6 +609,7 @@ class DockerRuntime:
         names = [line.strip() for line in output.splitlines() if line.strip()]
         for name in names:
             await self.remove(name)
+        await self._cleanup_stale_network_endpoints()
 
 
 @dataclass
@@ -548,6 +636,7 @@ class BrowserSessionManager:
         self._sessions: dict[str, BrowserSession] = {}
         self._by_user: dict[str, str] = {}
         self._last_display_recovery: dict[str, float] = {}
+        self._display_recovery_attempts: dict[str, int] = {}
         self._dead_reported: set[str] = set()
         self._lock = asyncio.Lock()
         self._reaper: asyncio.Task[None] | None = None
@@ -612,6 +701,7 @@ class BrowserSessionManager:
             self._sessions.clear()
             self._by_user.clear()
             self._last_display_recovery.clear()
+            self._display_recovery_attempts.clear()
             self._dead_reported.clear()
             if await self._runtime.available():
                 await asyncio.gather(
@@ -633,6 +723,8 @@ class BrowserSessionManager:
                 )
                 self._sessions.pop(existing.id, None)
                 self._by_user.pop(username, None)
+                self._display_recovery_attempts.pop(existing.id, None)
+                self._last_display_recovery.pop(existing.id, None)
                 self._dead_reported.discard(existing.id)
 
             if len(self._sessions) >= self._settings.browser_max_sessions:
@@ -655,6 +747,7 @@ class BrowserSessionManager:
             )
             self._sessions[session_id] = session
             self._by_user[username] = session_id
+            self._display_recovery_attempts[session_id] = 0
             return session
 
     async def remove(self, session_id: str, username: str) -> None:
@@ -663,6 +756,7 @@ class BrowserSessionManager:
             self._sessions.pop(session_id, None)
             self._by_user.pop(username, None)
             self._last_display_recovery.pop(session_id, None)
+            self._display_recovery_attempts.pop(session_id, None)
             self._dead_reported.discard(session_id)
         try:
             await self._runtime.remove(session.container)
@@ -672,6 +766,7 @@ class BrowserSessionManager:
     async def restart(self, session_id: str, username: str) -> BrowserSession:
         async with self._lock:
             session = self.get(session_id, username)
+            self._display_recovery_attempts[session_id] = 0
             await self._restart_or_recreate(session, username)
             now = self._clock()
             self._last_display_recovery[session_id] = now
@@ -683,6 +778,17 @@ class BrowserSessionManager:
     ) -> BrowserSession:
         async with self._lock:
             session = self.get(session_id, username)
+            attempts = self._display_recovery_attempts.get(session_id, 0)
+            if attempts >= _DISPLAY_RECOVERY_MAX_ATTEMPTS:
+                logger.error(
+                    "Browser display recovery limit reached for %s; manual restart required",
+                    session.container,
+                )
+                raise BrowserUnavailable(
+                    "The browser display could not be recovered after "
+                    f"{_DISPLAY_RECOVERY_MAX_ATTEMPTS} automatic attempts. "
+                    "Restart the browser session manually."
+                )
             now = self._clock()
             last = self._last_display_recovery.get(session_id, 0.0)
             if now - last < _DISPLAY_RECOVERY_COOLDOWN_SECONDS:
@@ -691,13 +797,24 @@ class BrowserSessionManager:
                     session.container,
                 )
                 return session
+            attempts += 1
+            self._display_recovery_attempts[session_id] = attempts
             self._last_display_recovery[session_id] = now
+            logger.info(
+                "Recovering browser display for %s (attempt %s/%s)",
+                session.container,
+                attempts,
+                _DISPLAY_RECOVERY_MAX_ATTEMPTS,
+            )
             await self.report_display_failure(session_id, username, reason=reason)
             try:
                 await self._restart_or_recreate(session, username)
             except BrowserError as exc:
                 logger.error("Browser display recovery failed for %s: %s", session.container, exc)
-                raise BrowserUnavailable("The browser display could not be recovered.") from exc
+                raise BrowserUnavailable(
+                    "The browser display could not be recovered after "
+                    f"{attempts} automatic attempt(s)."
+                ) from exc
             session.last_activity = self._clock()
             logger.info("Recovered browser display for %s", session.container)
             return session
@@ -752,6 +869,7 @@ class BrowserSessionManager:
             novnc_port=self._settings.browser_novnc_port,
             memory=self._settings.browser_memory_limit,
             cpus=self._settings.browser_cpus,
+            pids_limit=self._settings.browser_pids_limit,
         )
 
     async def navigate(

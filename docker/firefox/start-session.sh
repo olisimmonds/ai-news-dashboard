@@ -21,6 +21,19 @@ NOVNC_HEALTH_FAILURES=0
 PROCESS_SAMPLES="${DIAG_DIR}/process-samples.log"
 PROCESS_SAMPLE_LINES=4000
 
+read_cgroup_value() {
+    local name="$1"
+    local controller="${2:-}"
+    local path
+    for path in "/sys/fs/cgroup/$name" ${controller:+/sys/fs/cgroup/$controller/$name}; do
+        if [ -r "$path" ]; then
+            cat "$path" 2>/dev/null || true
+            return 0
+        fi
+    done
+    return 0
+}
+
 absolute_profile_path() {
     local path="$1"
     case "$path" in
@@ -102,6 +115,12 @@ user_pref("browser.tabs.warnOnClose", false);
 user_pref("browser.tabs.warnOnCloseOtherTabs", false);
 user_pref("dom.ipc.forkserver.enable", false);
 user_pref("dom.ipc.processCount", 2);
+user_pref("dom.ipc.processCount.file", 1);
+user_pref("dom.ipc.processCount.extension", 1);
+user_pref("dom.ipc.processCount.privilegedabout", 1);
+user_pref("dom.ipc.processCount.privilegedmozilla", 1);
+user_pref("dom.ipc.processCount.webIsolated", 1);
+user_pref("dom.ipc.processCount.webServiceWorker", 1);
 user_pref("browser.tabs.unloadOnLowMemory", true);
 PREFERENCES
     log "wrote managed user.js preferences"
@@ -117,6 +136,11 @@ write_environment_info() {
         printf 'image_firefox_version_file=%s\n' "$(cat /usr/share/meridian/firefox-esr-version 2>/dev/null || true)"
         printf 'kernel=%s\n' "$(uname -srmo 2>/dev/null || uname -a || true)"
         printf 'os_release=%s\n' "$(tr '\n' ' ' < /etc/os-release 2>/dev/null || true)"
+        printf 'proc_cmdline=%s\n' "$(cat /proc/cmdline 2>/dev/null || true)"
+        printf 'cgroup_type=%s\n' "$(stat -fc %T /sys/fs/cgroup 2>/dev/null || true)"
+        printf 'cgroup_controllers=%s\n' \
+            "$(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null || true)"
+        printf 'pids_max=%s\n' "$(read_cgroup_value pids.max pids)"
         printf 'xvnc_version=%s\n' "$(Xvnc -version 2>&1 | head -n 1 || true)"
     } > "$path" 2>&1 || true
 }
@@ -125,7 +149,9 @@ sample_processes() {
     mkdir -p "$DIAG_DIR"
     {
         printf '=== %s ===\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        ps -eo pid,ppid,stat,etimes,rss,comm,args 2>/dev/null || true
+        printf 'tasks_current=%s\n' "$(read_cgroup_value pids.current pids)"
+        printf 'tasks_max=%s\n' "$(read_cgroup_value pids.max pids)"
+        ps -eo pid,ppid,nlwp,stat,etimes,rss,comm,args 2>/dev/null || true
     } >> "$PROCESS_SAMPLES" 2>/dev/null || true
     if [ "$(wc -l < "$PROCESS_SAMPLES" 2>/dev/null || printf '0')" -gt "$PROCESS_SAMPLE_LINES" ]; then
         tail -n $((PROCESS_SAMPLE_LINES / 2)) "$PROCESS_SAMPLES" > "${PROCESS_SAMPLES}.tmp" 2>/dev/null \
@@ -165,6 +191,14 @@ collect_crash_artifacts() {
         tail -n 400 "$PROCESS_SAMPLES" > "$archive/process-samples-tail.log" 2>/dev/null || true
     fi
     {
+        printf 'captured_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'pids_current=%s\n' "$(read_cgroup_value pids.current pids)"
+        printf 'pids_max=%s\n' "$(read_cgroup_value pids.max pids)"
+        printf '%s\n' 'pids_events:'
+        read_cgroup_value pids.events pids | sed 's/^/  /'
+        printf 'thread_count_hint=sum nlwp in the last process sample before the crash\n'
+    } > "$archive/thread-summary.txt" 2>/dev/null || true
+    {
         printf 'reason=%s\n' "$reason"
         printf 'captured_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         printf 'firefox_pid=%s\n' "${FIREFOX_PID:-}"
@@ -182,18 +216,27 @@ persist_crash_snapshot() {
 }
 
 collect_cgroup_metrics() {
-    local name
-    for name in \
-        memory.events \
-        memory.peak \
-        memory.current \
-        memory.max \
-        memory.swap.current \
-        pids.current \
-        pids.max; do
-        if [ -r "/sys/fs/cgroup/$name" ]; then
-            printf '%s:\n' "$name"
-            sed 's/^/  /' "/sys/fs/cgroup/$name" 2>/dev/null || true
+    local path
+    printf 'type=%s\n' "$(stat -fc %T /sys/fs/cgroup 2>/dev/null || true)"
+    printf 'controllers=%s\n' "$(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null || true)"
+    printf 'proc_cmdline=%s\n' "$(cat /proc/cmdline 2>/dev/null || true)"
+    for path in \
+        /sys/fs/cgroup/memory.events \
+        /sys/fs/cgroup/memory.peak \
+        /sys/fs/cgroup/memory.current \
+        /sys/fs/cgroup/memory.max \
+        /sys/fs/cgroup/memory.swap.current \
+        /sys/fs/cgroup/pids.current \
+        /sys/fs/cgroup/pids.max \
+        /sys/fs/cgroup/pids.events \
+        /sys/fs/cgroup/memory/memory.limit_in_bytes \
+        /sys/fs/cgroup/memory/memory.usage_in_bytes \
+        /sys/fs/cgroup/pids/pids.current \
+        /sys/fs/cgroup/pids/pids.max \
+        /sys/fs/cgroup/pids/pids.events; do
+        if [ -r "$path" ]; then
+            printf '%s:\n' "$path"
+            sed 's/^/  /' "$path" 2>/dev/null || true
         fi
     done
 }
@@ -211,8 +254,11 @@ persist_snapshot() {
         if [ -f "${DIAG_DIR}/environment.log" ]; then
             sed 's/^/  /' "${DIAG_DIR}/environment.log"
         fi
+        printf '%s\n' 'tasks:'
+        printf '  current=%s\n' "$(read_cgroup_value pids.current pids)"
+        printf '  max=%s\n' "$(read_cgroup_value pids.max pids)"
         printf '%s\n' 'processes:'
-        ps -eo pid,ppid,stat,rss,comm,args 2>/dev/null || true
+        ps -eo pid,ppid,nlwp,stat,rss,comm,args 2>/dev/null || true
         printf '%s\n' 'profile-session-files:'
         if [ -n "$PROFILE_DIR" ] && [ -d "$PROFILE_DIR" ]; then
             find "$PROFILE_DIR" -maxdepth 2 \

@@ -439,6 +439,45 @@ async def test_manager_recovers_display_and_keeps_profile_volume(
     assert runtime.diagnostics_calls == [session.container]
 
 
+async def test_manager_caps_display_recovery_attempts(browser_settings: Settings) -> None:
+    runtime = FakeRuntime()
+    now = [1000.0]
+    manager = BrowserSessionManager(browser_settings, runtime, clock=lambda: now[0])
+    session = await manager.get_or_create("alice")
+
+    await manager.recover_display(session.id, "alice", reason="first failure")
+    now[0] += 16
+    await manager.recover_display(session.id, "alice", reason="second failure")
+
+    with pytest.raises(BrowserUnavailable, match="2 automatic attempts"):
+        await manager.recover_display(session.id, "alice", reason="third failure")
+
+    assert runtime.restarts == [session.container, session.container]
+    assert len(runtime.diagnostics_calls) == 2
+
+
+async def test_manager_manual_restart_resets_display_recovery_limit(
+    browser_settings: Settings,
+) -> None:
+    runtime = FakeRuntime()
+    now = [1000.0]
+    manager = BrowserSessionManager(browser_settings, runtime, clock=lambda: now[0])
+    session = await manager.get_or_create("alice")
+
+    for attempt in range(2):
+        await manager.recover_display(session.id, "alice", reason=f"failure {attempt}")
+        now[0] += 16
+    with pytest.raises(BrowserUnavailable):
+        await manager.recover_display(session.id, "alice", reason="limit reached")
+
+    await manager.restart(session.id, "alice")
+    now[0] += 16
+    recovered = await manager.recover_display(session.id, "alice", reason="after manual restart")
+
+    assert recovered.id == session.id
+    assert len(runtime.restarts) == 4
+
+
 def test_manager_stop_removes_sessions(browser_settings: Settings) -> None:
     async def run() -> tuple[int, int]:
         runtime = FakeRuntime()
@@ -538,6 +577,7 @@ def test_docker_start_reports_diagnostics_before_cleanup(
         novnc_port=6080,
         memory="1200m",
         cpus="1.5",
+        pids_limit=768,
     )
 
     with caplog.at_level(logging.ERROR), pytest.raises(BrowserUnavailable, match="window"):
@@ -547,6 +587,7 @@ def test_docker_start_reports_diagnostics_before_cleanup(
     assert "--rm" not in run_args
     assert "--stop-timeout" in run_args
     assert run_args[run_args.index("--stop-timeout") + 1] == "30"
+    assert run_args[run_args.index("--pids-limit") + 1] == "768"
 
     cleanup_index = max(index for index, event in enumerate(events) if event == "run:rm")
     assert events.index("diagnostics") < cleanup_index
@@ -666,23 +707,50 @@ def test_docker_diagnostics_report_oom_processes_and_resources(
                     "Error": "",
                     "Health": {"Status": "unhealthy"},
                 },
-                "HostConfig": {"Memory": 1258291200, "ShmSize": 536870912},
+                "HostConfig": {
+                    "Memory": 1258291200,
+                    "PidsLimit": 768,
+                    "ShmSize": 536870912,
+                },
                 "Config": {"StopTimeout": 30},
                 "RestartCount": 2,
             }
             return json.dumps(state), "", 0
+        if args[0] == "info":
+            return (
+                json.dumps(
+                    {
+                        "CgroupDriver": "systemd",
+                        "CgroupVersion": "2",
+                        "MemoryLimit": True,
+                        "SwapLimit": True,
+                        "PidsLimit": True,
+                        "ServerVersion": "28.0.0",
+                        "Warnings": [],
+                    }
+                ),
+                "",
+                0,
+            )
         if args[0] == "exec":
             return (
                 (
                     "memory.events:\noom 1\noom_kill 1\n"
                     "memory.max:\n1258291200\n"
                     "memory.current:\n1048576000\n"
+                    "pids.current:\n42\n"
+                    "pids.max:\n768\n"
+                    "pids.events:\nmax 3\n"
                 ),
                 "",
                 0,
             )
         if args[0] == "top":
-            return "PID COMMAND\n1 Xvnc\n2 websockify\n3 firefox-esr", "", 0
+            return (
+                "PID PPID NLWP COMMAND\n1 0 12 Xvnc\n2 0 8 websockify\n3 1 44 firefox-esr",
+                "",
+                0,
+            )
         if args[0] == "stats":
             return "memory=1.1GiB / 1.2GiB cpu=4.00%", "", 0
         if args[0] == "logs":
@@ -698,12 +766,20 @@ def test_docker_diagnostics_report_oom_processes_and_resources(
     assert "restart_count=2" in diagnostics
     assert "memory_limit=1258291200" in diagnostics
     assert "configured_memory_limit=1200m" in diagnostics
+    assert "pids_limit=768" in diagnostics
+    assert "configured_pids_limit=768" in diagnostics
     assert "shm_size=536870912" in diagnostics
     assert "stop_timeout=30" in diagnostics
+    assert "cgroup_version=2" in diagnostics
+    assert "memory_limit_support=True" in diagnostics
     assert "memory.events:\noom 1" in diagnostics
     assert "memory.max:\n1258291200" in diagnostics
     assert "memory.current:\n1048576000" in diagnostics
+    assert "pids.current:\n42" in diagnostics
+    assert "pids.max:\n768" in diagnostics
+    assert "pids.events:\nmax 3" in diagnostics
     assert "memory=1.1GiB / 1.2GiB" in diagnostics
+    assert "NLWP" in diagnostics
     assert "websockify" in diagnostics
     assert "Firefox content process terminated" in diagnostics
 
@@ -731,6 +807,12 @@ def test_firefox_policy_limits_content_processes_and_memory_pressure() -> None:
     assert preferences["dom.ipc.forkserver.enable"]["Value"] is False
     assert preferences["dom.ipc.forkserver.enable"]["Status"] == "locked"
     assert preferences["dom.ipc.processCount"]["Value"] == 2
+    assert preferences["dom.ipc.processCount.file"]["Value"] == 1
+    assert preferences["dom.ipc.processCount.extension"]["Value"] == 1
+    assert preferences["dom.ipc.processCount.privilegedabout"]["Value"] == 1
+    assert preferences["dom.ipc.processCount.privilegedmozilla"]["Value"] == 1
+    assert preferences["dom.ipc.processCount.webIsolated"]["Value"] == 1
+    assert preferences["dom.ipc.processCount.webServiceWorker"]["Value"] == 1
     assert preferences["browser.tabs.unloadOnLowMemory"]["Value"] is True
     assert preferences["browser.tabs.warnOnClose"]["Value"] is False
     assert preferences["browser.sessionstore.resume_from_crash"]["Value"] is False
@@ -759,6 +841,10 @@ def test_container_supervisor_shuts_down_cleanly_and_quarantines_crash_state() -
     assert "sending SIGKILL" in script
     assert "collect_crash_artifacts" in script
     assert "process-samples" in script
+    assert "nlwp" in script
+    assert "pids.current" in script
+    assert "pids.events" in script
+    assert "thread-summary" in script
     assert "firefox-esr --version" in script
     assert "dpkg-query" in script
     assert "firefox-esr-version" in script
@@ -786,8 +872,9 @@ def test_custom_novnc_page_reconnects_after_display_disconnect() -> None:
         encoding="utf-8"
     )
 
-    assert "MAX_RECONNECT_ATTEMPTS" in page
+    assert "MAX_RECONNECT_ATTEMPTS = 2" in page
     assert "scheduleReconnect" in page
+    assert "reconnectExhausted" in page
     assert 'addEventListener("disconnect"' in page
     assert "meridian-browser-reconnect-failed" in page
     assert "rfb.scaleViewport" in page
@@ -810,10 +897,73 @@ def test_docker_uses_graceful_stop_and_restart_timeouts(
     asyncio.run(runtime.restart("meridian-browser-test"))
 
     assert calls == [
+        (
+            "network",
+            "disconnect",
+            "--force",
+            browser_settings.browser_network,
+            "meridian-browser-test",
+        ),
         ("stop", "--time", "30", "meridian-browser-test"),
         ("rm", "--force", "meridian-browser-test"),
         ("restart", "--time", "30", "meridian-browser-test"),
     ]
+
+
+def test_docker_cleanup_removes_stale_browser_network_endpoints(
+    browser_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = DockerRuntime(browser_settings)
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*args: str, timeout: float = 20.0, check: bool = True) -> str:
+        calls.append(args)
+        if args[:2] == ("ps", "--all"):
+            return "meridian-browser-live\n"
+        if args[:2] == ("network", "inspect"):
+            return json.dumps(
+                {
+                    "one": {"Name": "meridian-browser-stale"},
+                    "two": {"Name": "other-service"},
+                }
+            )
+        return ""
+
+    async def fake_execute(*args: str, timeout: float = 20.0) -> tuple[str, str, int]:
+        calls.append(args)
+        if args[0] == "inspect":
+            if args[1] == "meridian-browser-live":
+                return "{}", "", 0
+            return "", "No such container", 1
+        return "", "", 0
+
+    monkeypatch.setattr(runtime, "_run", fake_run)
+    monkeypatch.setattr(runtime, "_execute", fake_execute)
+
+    asyncio.run(runtime.cleanup_orphans())
+
+    assert (
+        "network",
+        "disconnect",
+        "--force",
+        browser_settings.browser_network,
+        "meridian-browser-live",
+    ) in calls
+    assert (
+        "network",
+        "disconnect",
+        "--force",
+        browser_settings.browser_network,
+        "meridian-browser-stale",
+    ) in calls
+    assert (
+        "network",
+        "disconnect",
+        "--force",
+        browser_settings.browser_network,
+        "other-service",
+    ) not in calls
 
 
 def test_manager_records_diagnostics_when_container_exits(
@@ -902,4 +1052,9 @@ def test_stability_script_covers_profiles_sites_and_crash_artifacts() -> None:
     assert "minidumps" in script
     assert "HostConfig.Memory" in script
     assert "EXPECTED_MEMORY_BYTES" in script
+    assert "PIDS_LIMIT" in script
+    assert "EXPECTED_PIDS_LIMIT" in script
+    assert "HostConfig.PidsLimit" in script
+    assert "cgroup_pids_current" in script
+    assert "thread_total" in script
     assert "SIGSEGV" in script

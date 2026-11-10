@@ -108,6 +108,30 @@
         "Value": 2,
         "Status": "locked"
       },
+      "dom.ipc.processCount.extension": {
+        "Value": 1,
+        "Status": "locked"
+      },
+      "dom.ipc.processCount.file": {
+        "Value": 1,
+        "Status": "locked"
+      },
+      "dom.ipc.processCount.privilegedabout": {
+        "Value": 1,
+        "Status": "locked"
+      },
+      "dom.ipc.processCount.privilegedmozilla": {
+        "Value": 1,
+        "Status": "locked"
+      },
+      "dom.ipc.processCount.webIsolated": {
+        "Value": 1,
+        "Status": "locked"
+      },
+      "dom.ipc.processCount.webServiceWorker": {
+        "Value": 1,
+        "Status": "locked"
+      },
       "permissions.default.camera": {
         "Value": 2,
         "Status": "locked"
