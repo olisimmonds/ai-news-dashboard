@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -105,6 +106,7 @@ class DockerRuntime:
         self._binary = settings.browser_docker_binary
         self._network = settings.browser_network
         self._diagnostics_dir = settings.browser_diagnostics_dir
+        self._memory_limit = settings.browser_memory_limit
         self._available: bool | None = None
         self._checked_at = 0.0
 
@@ -263,6 +265,7 @@ class DockerRuntime:
                 )
                 limits = (
                     f"memory_limit={host_config.get('Memory')} "
+                    f"configured_memory_limit={self._memory_limit} "
                     f"shm_size={host_config.get('ShmSize')} "
                     f"stop_timeout={config.get('StopTimeout')}"
                 )
@@ -274,14 +277,22 @@ class DockerRuntime:
             limits = "(no limits data)"
 
         try:
+            cgroup_script = (
+                "for name in memory.events memory.max memory.current "
+                "memory.swap.current pids.current pids.max; do "
+                "printf '%s:\\n' \"$name\"; "
+                'cat "/sys/fs/cgroup/$name" 2>/dev/null || true; '
+                "done"
+            )
             events, events_error, events_code = await self._execute(
                 "exec",
                 name,
-                "cat",
-                "/sys/fs/cgroup/memory.events",
+                "sh",
+                "-c",
+                cgroup_script,
                 timeout=5,
             )
-            cgroup = events or events_error or f"cat exited {events_code}"
+            cgroup = events or events_error or f"cgroup read exited {events_code}"
         except BrowserUnavailable as exc:
             cgroup = str(exc)
 
@@ -350,10 +361,39 @@ class DockerRuntime:
             stale.unlink(missing_ok=True)
         return str(path)
 
-    async def persist_diagnostics(
-        self, name: str, details: str, *, reason: str
-    ) -> str | None:
+    async def _export_container_artifacts(self, name: str) -> str | None:
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        directory = self._diagnostics_dir / "artifacts" / f"{safe_name}-{timestamp}"
         try:
+            directory.mkdir(parents=True, exist_ok=True)
+            _stdout, stderr, returncode = await self._execute(
+                "cp",
+                f"{name}:/home/browser/.meridian/diagnostics/.",
+                str(directory),
+                timeout=15,
+            )
+        except (BrowserError, OSError) as exc:
+            logger.warning("Could not export browser diagnostics artifacts for %s: %s", name, exc)
+            with contextlib.suppress(OSError):
+                directory.rmdir()
+            return None
+        if returncode != 0:
+            logger.warning(
+                "Could not export browser diagnostics artifacts for %s: %s",
+                name,
+                stderr or f"docker cp exited {returncode}",
+            )
+            with contextlib.suppress(OSError):
+                directory.rmdir()
+            return None
+        return str(directory)
+
+    async def persist_diagnostics(self, name: str, details: str, *, reason: str) -> str | None:
+        try:
+            artifacts = await self._export_container_artifacts(name)
+            if artifacts is not None:
+                details = f"{details}\nartifacts_dir: {artifacts}"
             return await asyncio.to_thread(
                 self._persist_diagnostics_sync, name, details, reason=reason
             )
@@ -551,9 +591,7 @@ class BrowserSessionManager:
         if not self.enabled:
             return
         self._reaper = asyncio.create_task(self._reap_loop(), name="meridian-browser-reaper")
-        self._monitor = asyncio.create_task(
-            self._monitor_loop(), name="meridian-browser-monitor"
-        )
+        self._monitor = asyncio.create_task(self._monitor_loop(), name="meridian-browser-monitor")
         if await self._runtime.available():
             try:
                 await self._runtime.cleanup_orphans()
@@ -699,9 +737,7 @@ class BrowserSessionManager:
                     session.container,
                     exc,
                 )
-                await self._record_diagnostics(
-                    session.container, f"restart failed: {exc}"
-                )
+                await self._record_diagnostics(session.container, f"restart failed: {exc}")
         await self._runtime.remove(session.container)
         logger.info("Recreating browser container %s", session.container)
         session.port = await self._runtime.start(self._spec(username))

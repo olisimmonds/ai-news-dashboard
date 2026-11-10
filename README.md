@@ -128,10 +128,10 @@ The private browser is deliberately separate from the news database. A phone ope
 - Browser accounts use scrypt password hashes. Sessions use signed, HttpOnly cookies and are closed on sign-out.
 - Idle sessions are reaped after `AI_DASHBOARD_BROWSER_IDLE_TIMEOUT_MINUTES`; at most `AI_DASHBOARD_BROWSER_MAX_SESSIONS` containers run at once.
 - Firefox force-installs uBlock Origin, blocks popups, enables tracking protection, disables telemetry, password storage and app updates.
-- Firefox is capped at two content processes and is configured not to restore tabs after a crash, reducing memory pressure on the Pi.
+- Firefox is capped at two content processes, configured not to restore tabs after a crash, and has its fork server disabled (`dom.ipc.forkserver.enable=false`) as a workaround for the Firefox 153.5/153.6 ESR content-process crash reports. The sandbox and site isolation stay enabled; this is not a security downgrade.
 - The container asks Firefox to quit, then falls back to SIGTERM and a bounded wait before killing it, so a normal restart writes a clean profile. If the previous run ended uncleanly, only the session-restore files are moved aside into the profile volume; bookmarks, history, cookies, logins and favourites are kept. This prevents the Firefox "Sorry. We're having trouble getting your pages back." screen from trapping the browser after an OOM kill or forced restart.
 - The container includes a Meridian noVNC page that reconnects automatically after a display WebSocket drops, then asks Meridian to restart the display if reconnection keeps failing. The proxy logs client and upstream close codes so the next disconnect has a recorded cause.
-- Crash reporter minidumps, cgroup memory counters, process lists and session-file sizes are written under `/home/browser/.meridian/diagnostics` inside the profile volume. Meridian also saves Docker state, limits, OOM flag and logs to `data/browser-diagnostics` on the host, including when a container exits while a session is still active.
+- Crash reporter minidumps, their `.extra` annotation files, cgroup memory counters, process lists and session-file sizes are written under `/home/browser/.meridian/diagnostics` inside the profile volume. The supervisor also records the installed Firefox package version and samples process command lines every five seconds. Meridian copies the diagnostics directory to `data/browser-diagnostics/artifacts` on the host and saves Docker state, limits, OOM flag and logs to `data/browser-diagnostics` before removing the container, including when a container exits while a session is still active.
 - The container has a Docker health check for Xvnc, openbox, websockify and Firefox. The startup supervisor restarts a dead or unresponsive websockify/openbox process and exits the container if Xvnc or Firefox disappears.
 - Meridian retries a failed display request, then stops and restarts the container in place when the display is genuinely stale. The named profile volume is retained.
 - There is no phone-side file transfer, host folder mount or clipboard permission granted to the embedded display. Downloads remain inside the user's browser volume.
@@ -243,7 +243,35 @@ docker exec --user 1000 --env XAUTHORITY=/home/browser/.Xauthority <container-na
 docker rm -f meridian-firefox-smoke
 ```
 
-### Apply the crash-recovery fix on the Pi
+### Firefox SIGSEGV evidence
+
+The Pi logs show Firefox content processes exiting with signal 11 (`SIGSEGV`) and the container exiting `245`. Exit `245` is `EXIT_CODE_CONTENT_CRASHED`: the image sets `MOZ_CRASHREPORTER_SHUTDOWN=1`, so Firefox force-quits after the first content-process crash. It is a consequence of the crash, not a separate failure.
+
+The current image disables Firefox's fork server (`dom.ipc.forkserver.enable=false`) as a targeted workaround for reports against Firefox 153.5/153.6 ESR. This is a workaround, not a confirmed root-cause fix. Verify it on the Pi with the stability test before treating the problem as resolved.
+
+Capture the exact versions before changing anything:
+
+```bash
+docker exec <container-name> firefox-esr --version
+docker exec <container-name> dpkg-query -W -f='${Version}\n' firefox-esr
+docker inspect --format 'memory={{.HostConfig.Memory}} shm={{.HostConfig.ShmSize}}' <container-name>
+docker exec <container-name> sh -c 'for f in memory.events memory.max memory.current; do echo "$f:"; cat /sys/fs/cgroup/$f; done'
+```
+
+`HostConfig.Memory=0` with a non-zero cgroup `memory.max` means Docker reported no host-level limit while the cgroup still enforces one. Meridian diagnostics now include both `configured_memory_limit` (from `AI_DASHBOARD_BROWSER_MEMORY_LIMIT`) and the cgroup values so this can be checked directly. `1200m` must be `1258291200` bytes.
+
+Minidumps (`.dmp`) and their `.extra` annotation files are under the selected profile's `minidumps/` directory. The supervisor copies them into `<profile-volume>/.meridian/diagnostics/crash-*` as soon as Firefox exits non-zero and Meridian exports the diagnostics directory to `data/browser-diagnostics/artifacts/` before removing the container. Check the host too:
+
+```bash
+ls -lt data/browser-diagnostics/
+find data/browser-diagnostics/artifacts -type f \( -name '*.dmp' -o -name '*.extra' \)
+journalctl -k --since '1 hour ago' | grep -Ei 'segfault|oom|killed process|firefox'
+sudo dmesg -T | grep -Ei 'segfault|oom|killed process|firefox'
+```
+
+If no `.dmp` exists, say so explicitly: the crash evidence is incomplete and the fix is unverified.
+
+### Apply the crash-recovery and SIGSEGV fixes on the Pi
 
 ```bash
 cd /home/pi/ai-news-dashboard
@@ -251,6 +279,24 @@ git pull
 docker build -t meridian-firefox:latest docker/firefox
 sudo systemctl restart meridian
 ```
+
+To reproduce an exact package version, pin it at build time. The default build keeps the current bookworm-security ESR:
+
+```bash
+docker build --build-arg FIREFOX_ESR_VERSION=153.6.0esr-1~deb12u2 \
+  -t meridian-firefox:latest docker/firefox
+```
+
+Only pin a version you have tested on the Pi; an older ESR also gives up later security updates. The image records the installed version in `/usr/share/meridian/firefox-esr-version`, and the supervisor writes it to `.meridian/diagnostics/environment.log` on every start.
+
+Run the controlled stability matrix (clean and persistent profiles; blank, BBC News and a second reputable site):
+
+```bash
+chmod +x scripts/browser-stability-test.sh
+scripts/browser-stability-test.sh --build --matrix
+```
+
+Each run preserves `container.log`, `inspect.json`, `top.txt`, `diagnostics/` and any minidumps under `data/browser-stability/`. The script fails a run when the container exits early, a minidump appears, crash text appears in the log, or the memory limit does not match `1258291200` bytes. Change one variable at a time when narrowing a failure; do not use a single test site as proof that the crash is fixed.
 
 The existing `meridian-browser-home-*` volumes are reused. The supervisor records the selected Firefox profile in `.meridian/diagnostics/profile-path` and launches Firefox with `--profile`, so crash cleanup always targets the profile Firefox actually used. If a browser is currently stuck on the Firefox recovery page, close the session from Meridian or stop the container once; the next start quarantines the stale session files and opens a clean window without touching bookmarks or favourites.
 

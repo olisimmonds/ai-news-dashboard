@@ -1,5 +1,7 @@
 FROM debian:bookworm-slim
 
+ARG FIREFOX_ESR_VERSION=
+
 ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/home/browser \
     DISPLAY=:1 \
@@ -15,7 +17,7 @@ RUN apt-get update \
         ca-certificates \
         curl \
         dbus-x11 \
-        firefox-esr \
+        "firefox-esr${FIREFOX_ESR_VERSION:+=$FIREFOX_ESR_VERSION}" \
         fonts-dejavu-core \
         fonts-noto-color-emoji \
         gosu \
@@ -26,6 +28,8 @@ RUN apt-get update \
         websockify \
         xdotool \
         x11-utils \
+    && mkdir -p /usr/share/meridian \
+    && dpkg-query -W -f='${Version}\n' firefox-esr > /usr/share/meridian/firefox-esr-version \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home --uid 1000 --shell /usr/sbin/nologin browser \

@@ -100,6 +100,10 @@
         "Value": false,
         "Status": "locked"
       },
+      "dom.ipc.forkserver.enable": {
+        "Value": false,
+        "Status": "locked"
+      },
       "dom.ipc.processCount": {
         "Value": 2,
         "Status": "locked"

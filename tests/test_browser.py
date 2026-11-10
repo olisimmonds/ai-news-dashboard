@@ -672,7 +672,15 @@ def test_docker_diagnostics_report_oom_processes_and_resources(
             }
             return json.dumps(state), "", 0
         if args[0] == "exec":
-            return "oom 1\noom_kill 1\n", "", 0
+            return (
+                (
+                    "memory.events:\noom 1\noom_kill 1\n"
+                    "memory.max:\n1258291200\n"
+                    "memory.current:\n1048576000\n"
+                ),
+                "",
+                0,
+            )
         if args[0] == "top":
             return "PID COMMAND\n1 Xvnc\n2 websockify\n3 firefox-esr", "", 0
         if args[0] == "stats":
@@ -689,9 +697,12 @@ def test_docker_diagnostics_report_oom_processes_and_resources(
     assert "health=unhealthy" in diagnostics
     assert "restart_count=2" in diagnostics
     assert "memory_limit=1258291200" in diagnostics
+    assert "configured_memory_limit=1200m" in diagnostics
     assert "shm_size=536870912" in diagnostics
     assert "stop_timeout=30" in diagnostics
-    assert "cgroup_memory_events: oom 1" in diagnostics
+    assert "memory.events:\noom 1" in diagnostics
+    assert "memory.max:\n1258291200" in diagnostics
+    assert "memory.current:\n1048576000" in diagnostics
     assert "memory=1.1GiB / 1.2GiB" in diagnostics
     assert "websockify" in diagnostics
     assert "Firefox content process terminated" in diagnostics
@@ -717,6 +728,8 @@ def test_firefox_policy_limits_content_processes_and_memory_pressure() -> None:
     )
     preferences = policies["policies"]["Preferences"]
 
+    assert preferences["dom.ipc.forkserver.enable"]["Value"] is False
+    assert preferences["dom.ipc.forkserver.enable"]["Status"] == "locked"
     assert preferences["dom.ipc.processCount"]["Value"] == 2
     assert preferences["browser.tabs.unloadOnLowMemory"]["Value"] is True
     assert preferences["browser.tabs.warnOnClose"]["Value"] is False
@@ -731,7 +744,7 @@ def test_container_supervisor_shuts_down_cleanly_and_quarantines_crash_state() -
     assert "trap on_signal INT TERM" in script
     assert "trap cleanup EXIT" in script
     assert "ctrl+q" in script
-    assert "stop_child \"$FIREFOX_PID\" \"Firefox\" 10" in script
+    assert 'stop_child "$FIREFOX_PID" "Firefox" 10' in script
     assert "unclean-shutdown" in script
     assert "profile-path" in script
     assert "profiles.ini" in script
@@ -740,9 +753,15 @@ def test_container_supervisor_shuts_down_cleanly_and_quarantines_crash_state() -
     assert "sessionCheckpoints.json" in script
     assert "sessionstore-backups" in script
     assert "resume_from_crash" in script
+    assert "dom.ipc.forkserver.enable" in script
     assert "dom.ipc.processCount" in script
     assert "memory.events" in script
     assert "sending SIGKILL" in script
+    assert "collect_crash_artifacts" in script
+    assert "process-samples" in script
+    assert "firefox-esr --version" in script
+    assert "dpkg-query" in script
+    assert "firefox-esr-version" in script
 
 
 def test_container_image_collects_crashes_and_uses_graceful_stop() -> None:
@@ -752,6 +771,10 @@ def test_container_image_collects_crashes_and_uses_graceful_stop() -> None:
 
     assert "MOZ_CRASHREPORTER=1" in dockerfile
     assert "MOZ_CRASHREPORTER_NO_REPORT=1" in dockerfile
+    assert "MOZ_CRASHREPORTER_SHUTDOWN=1" in dockerfile
+    assert "ARG FIREFOX_ESR_VERSION=" in dockerfile
+    assert "FIREFOX_ESR_VERSION" in dockerfile
+    assert "firefox-esr-version" in dockerfile
     assert "MERIDIAN_BROWSER_DIAGNOSTICS_DIR=/home/browser/.meridian/diagnostics" in dockerfile
     assert "/home/browser/.meridian/diagnostics" in dockerfile
     assert "COPY meridian.html /usr/share/novnc/meridian.html" in dockerfile
@@ -759,9 +782,9 @@ def test_container_image_collects_crashes_and_uses_graceful_stop() -> None:
 
 
 def test_custom_novnc_page_reconnects_after_display_disconnect() -> None:
-    page = (
-        Path(__file__).resolve().parents[1] / "docker" / "firefox" / "meridian.html"
-    ).read_text(encoding="utf-8")
+    page = (Path(__file__).resolve().parents[1] / "docker" / "firefox" / "meridian.html").read_text(
+        encoding="utf-8"
+    )
 
     assert "MAX_RECONNECT_ATTEMPTS" in page
     assert "scheduleReconnect" in page
@@ -809,9 +832,7 @@ def test_manager_records_diagnostics_when_container_exits(
     _, container = asyncio.run(scenario())
     assert manager.for_user("alice") is not None
     assert runtime.diagnostics_calls == [container]
-    assert runtime.persisted == [
-        (container, "container exited while session was active")
-    ]
+    assert runtime.persisted == [(container, "container exited while session was active")]
 
 
 def test_docker_persists_diagnostics_with_rotation(
@@ -837,3 +858,48 @@ def test_docker_persists_diagnostics_with_rotation(
     assert "reason: test failure" in contents
     assert "state: exited oom_killed=True" in contents
     assert len(list(diagnostics_dir.glob("*.log"))) == 50
+
+
+def test_docker_exports_crash_artifacts_before_persisting(
+    browser_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = DockerRuntime(browser_settings)
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_execute(*args: str, timeout: float = 20.0) -> tuple[str, str, int]:
+        calls.append(args)
+        return "", "", 0
+
+    monkeypatch.setattr(runtime, "_execute", fake_execute)
+
+    path = asyncio.run(
+        runtime.persist_diagnostics(
+            "meridian-browser-test",
+            "state: exited 245",
+            reason="firefox-exit-245",
+        )
+    )
+
+    assert path is not None
+    assert calls[0][0] == "cp"
+    assert calls[0][1] == "meridian-browser-test:/home/browser/.meridian/diagnostics/."
+    contents = Path(path).read_text(encoding="utf-8")
+    assert "artifacts_dir: " in contents
+    artifacts_dir = Path(contents.split("artifacts_dir: ", 1)[1].splitlines()[0])
+    assert artifacts_dir.is_dir()
+
+
+def test_stability_script_covers_profiles_sites_and_crash_artifacts() -> None:
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "browser-stability-test.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "--matrix" in script
+    assert "clean|persistent" in script
+    assert "blank|bbc|other|custom" in script
+    assert "MOZ_CRASHREPORTER_SHUTDOWN=0" in script
+    assert "minidumps" in script
+    assert "HostConfig.Memory" in script
+    assert "EXPECTED_MEMORY_BYTES" in script
+    assert "SIGSEGV" in script

@@ -18,6 +18,8 @@ WM_PID=""
 NOVNC_PID=""
 SLEEP_PID=""
 NOVNC_HEALTH_FAILURES=0
+PROCESS_SAMPLES="${DIAG_DIR}/process-samples.log"
+PROCESS_SAMPLE_LINES=4000
 
 absolute_profile_path() {
     local path="$1"
@@ -98,10 +100,85 @@ user_pref("browser.sessionstore.resume_from_crash", false);
 user_pref("browser.startup.page", 0);
 user_pref("browser.tabs.warnOnClose", false);
 user_pref("browser.tabs.warnOnCloseOtherTabs", false);
+user_pref("dom.ipc.forkserver.enable", false);
 user_pref("dom.ipc.processCount", 2);
 user_pref("browser.tabs.unloadOnLowMemory", true);
 PREFERENCES
     log "wrote managed user.js preferences"
+}
+
+write_environment_info() {
+    local path="${DIAG_DIR}/environment.log"
+    mkdir -p "$DIAG_DIR"
+    {
+        printf 'captured_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'firefox_version=%s\n' "$(firefox-esr --version 2>&1 | head -n 1 || true)"
+        printf 'firefox_package_version=%s\n' "$(dpkg-query -W -f='${Version}' firefox-esr 2>/dev/null || true)"
+        printf 'image_firefox_version_file=%s\n' "$(cat /usr/share/meridian/firefox-esr-version 2>/dev/null || true)"
+        printf 'kernel=%s\n' "$(uname -srmo 2>/dev/null || uname -a || true)"
+        printf 'os_release=%s\n' "$(tr '\n' ' ' < /etc/os-release 2>/dev/null || true)"
+        printf 'xvnc_version=%s\n' "$(Xvnc -version 2>&1 | head -n 1 || true)"
+    } > "$path" 2>&1 || true
+}
+
+sample_processes() {
+    mkdir -p "$DIAG_DIR"
+    {
+        printf '=== %s ===\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        ps -eo pid,ppid,stat,etimes,rss,comm,args 2>/dev/null || true
+    } >> "$PROCESS_SAMPLES" 2>/dev/null || true
+    if [ "$(wc -l < "$PROCESS_SAMPLES" 2>/dev/null || printf '0')" -gt "$PROCESS_SAMPLE_LINES" ]; then
+        tail -n $((PROCESS_SAMPLE_LINES / 2)) "$PROCESS_SAMPLES" > "${PROCESS_SAMPLES}.tmp" 2>/dev/null \
+            && mv "${PROCESS_SAMPLES}.tmp" "$PROCESS_SAMPLES" 2>/dev/null || true
+    fi
+}
+
+rotate_crash_artifacts() {
+    local count
+    count="$(find "$DIAG_DIR" -maxdepth 1 -mindepth 1 -type d -name 'crash-*' 2>/dev/null | wc -l)"
+    if [ "$count" -gt 20 ]; then
+        find "$DIAG_DIR" -maxdepth 1 -mindepth 1 -type d -name 'crash-*' \
+            -printf '%T@ %p\n' 2>/dev/null \
+            | sort -n | head -n $((count - 20)) | cut -d' ' -f2- \
+            | while IFS= read -r stale; do rm -rf "$stale"; done
+    fi
+}
+
+collect_crash_artifacts() {
+    local reason="$1"
+    local archive="${DIAG_DIR}/crash-$(date -u +%Y%m%dT%H%M%SZ)"
+    local profile="${PROFILE_DIR:-}"
+    local name
+    mkdir -p "$archive"
+    if [ -n "$profile" ] && [ -d "$profile" ]; then
+        printf '%s\n' "$profile" > "$archive/profile-path.txt"
+        for name in minidumps crashreports; do
+            if [ -d "$profile/$name" ]; then
+                mkdir -p "$archive/$name"
+                cp -a "$profile/$name/." "$archive/$name/" 2>/dev/null || true
+            fi
+        done
+        find "$profile" -maxdepth 3 -type f \( -name '*.extra' -o -name '*.dmp' \) \
+            -exec cp -a {} "$archive/" \; 2>/dev/null || true
+    fi
+    if [ -f "$PROCESS_SAMPLES" ]; then
+        tail -n 400 "$PROCESS_SAMPLES" > "$archive/process-samples-tail.log" 2>/dev/null || true
+    fi
+    {
+        printf 'reason=%s\n' "$reason"
+        printf 'captured_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'firefox_pid=%s\n' "${FIREFOX_PID:-}"
+        find "$archive" -maxdepth 2 -type f ! -name summary.txt \
+            -printf '%p %s bytes\n' 2>/dev/null || true
+    } > "$archive/summary.txt"
+    log "preserved crash artifacts in $archive"
+    rotate_crash_artifacts
+}
+
+persist_crash_snapshot() {
+    local label="$1"
+    collect_crash_artifacts "$label"
+    persist_snapshot "$label"
 }
 
 collect_cgroup_metrics() {
@@ -130,6 +207,10 @@ persist_snapshot() {
         printf 'captured_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         printf '%s\n' 'cgroup:'
         collect_cgroup_metrics
+        printf '%s\n' 'environment:'
+        if [ -f "${DIAG_DIR}/environment.log" ]; then
+            sed 's/^/  /' "${DIAG_DIR}/environment.log"
+        fi
         printf '%s\n' 'processes:'
         ps -eo pid,ppid,stat,rss,comm,args 2>/dev/null || true
         printf '%s\n' 'profile-session-files:'
@@ -138,6 +219,10 @@ persist_snapshot() {
                 \( -name 'sessionstore*' -o -name 'sessionCheckpoints.json' \
                 -o -path '*/minidumps/*' -o -path '*/crashreports/*' \) \
                 -printf '%p %s bytes\n' 2>/dev/null || true
+        fi
+        printf '%s\n' 'recent-process-samples:'
+        if [ -f "$PROCESS_SAMPLES" ]; then
+            tail -n 80 "$PROCESS_SAMPLES"
         fi
     } > "$path" 2>&1 || true
     log "wrote diagnostics to $path"
@@ -201,13 +286,13 @@ prepare_profile() {
         quarantine_session_state "$PROFILE_DIR"
     fi
 
-    if [ ! -f "$PROFILE_DIR/user.js" ]; then
-        write_user_js "$PROFILE_DIR"
-    fi
+    write_user_js "$PROFILE_DIR"
 
     rm -f "$MARKER"
     : > "$MARKER"
     log "using Firefox profile $PROFILE_DIR"
+    write_environment_info
+    sample_processes
     persist_snapshot "startup"
 }
 
@@ -292,7 +377,7 @@ shutdown() {
         log "Firefox shut down cleanly"
     else
         log "Firefox did not shut down cleanly (status $firefox_status)"
-        persist_snapshot "firefox-shutdown-${firefox_status}"
+        persist_crash_snapshot "firefox-shutdown-${firefox_status}"
     fi
 
     stop_child "$NOVNC_PID" "websockify" 5
@@ -405,6 +490,8 @@ while true; do
         exit 0
     fi
 
+    sample_processes
+
     if [ "$finished" = "$SLEEP_PID" ]; then
         if ! timeout 5 xdpyinfo -display :1 >/dev/null 2>&1; then
             log "Xvnc health check failed"
@@ -443,7 +530,7 @@ while true; do
             rm -f "$MARKER"
             log "Firefox exited cleanly"
         else
-            persist_snapshot "firefox-exit-${wait_status}"
+            persist_crash_snapshot "firefox-exit-${wait_status}"
         fi
         exit "$wait_status"
     fi
