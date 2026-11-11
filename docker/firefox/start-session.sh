@@ -8,16 +8,15 @@ log() {
 DIAG_DIR="${MERIDIAN_BROWSER_DIAGNOSTICS_DIR:-/home/browser/.meridian/diagnostics}"
 MOZILLA_DIR="${HOME}/.mozilla"
 PROFILE_POINTER="${DIAG_DIR}/profile-path"
-MARKER="${DIAG_DIR}/unclean-shutdown"
 PROFILE_DIR=""
 SHUTTING_DOWN=0
+SHUTDOWN_STATUS=0
 LAST_STATUS=0
 FIREFOX_PID=""
 XVNC_PID=""
 WM_PID=""
 NOVNC_PID=""
 SLEEP_PID=""
-NOVNC_HEALTH_FAILURES=0
 PROCESS_SAMPLES="${DIAG_DIR}/process-samples.log"
 PROCESS_SAMPLE_LINES=4000
 
@@ -113,7 +112,6 @@ user_pref("browser.sessionstore.resume_from_crash", false);
 user_pref("browser.startup.page", 0);
 user_pref("browser.tabs.warnOnClose", false);
 user_pref("browser.tabs.warnOnCloseOtherTabs", false);
-user_pref("dom.ipc.forkserver.enable", false);
 user_pref("dom.ipc.processCount", 2);
 user_pref("dom.ipc.processCount.file", 1);
 user_pref("dom.ipc.processCount.extension", 1);
@@ -274,45 +272,7 @@ persist_snapshot() {
     log "wrote diagnostics to $path"
 }
 
-quarantine_session_state() {
-    local profile="$1"
-    local archive="${DIAG_DIR}/session-quarantine/$(date -u +%Y%m%dT%H%M%SZ)"
-    local moved=0
-    local name
-    mkdir -p "$archive"
-    for name in \
-        sessionstore.jsonlz4 \
-        sessionstore.js \
-        sessionstore.bak \
-        sessionCheckpoints.json; do
-        if [ -e "$profile/$name" ]; then
-            if mv "$profile/$name" "$archive/$name" 2>/dev/null; then
-                moved=1
-            else
-                log "could not archive $profile/$name"
-            fi
-        fi
-    done
-    if [ -d "$profile/sessionstore-backups" ]; then
-        if mv "$profile/sessionstore-backups" "$archive/sessionstore-backups" 2>/dev/null; then
-            moved=1
-        else
-            log "could not archive $profile/sessionstore-backups"
-        fi
-    fi
-    for name in minidumps crashreports; do
-        if [ -d "$profile/$name" ]; then
-            mkdir -p "$archive/$name"
-            cp -a "$profile/$name/." "$archive/$name/" 2>/dev/null || true
-        fi
-    done
-    if [ "$moved" -eq 1 ]; then
-        log "archived previous session state in $archive"
-    fi
-}
-
 prepare_profile() {
-    local unclean=0
     mkdir -p "$DIAG_DIR"
     PROFILE_DIR="$(find_profile || true)"
     if [ -z "$PROFILE_DIR" ]; then
@@ -321,21 +281,11 @@ prepare_profile() {
     mkdir -p "$PROFILE_DIR"
     printf '%s\n' "$PROFILE_DIR" > "$PROFILE_POINTER"
 
-    if [ -f "$MARKER" ]; then
-        unclean=1
-    fi
-
-    if [ "$unclean" -eq 1 ]; then
-        log "previous browser session ended uncleanly"
-        find "$MOZILLA_DIR" -name lock -delete 2>/dev/null || true
-        find "$MOZILLA_DIR" -name .parentlock -delete 2>/dev/null || true
-        quarantine_session_state "$PROFILE_DIR"
-    fi
+    find "$MOZILLA_DIR" -name lock -delete 2>/dev/null || true
+    find "$MOZILLA_DIR" -name .parentlock -delete 2>/dev/null || true
 
     write_user_js "$PROFILE_DIR"
 
-    rm -f "$MARKER"
-    : > "$MARKER"
     log "using Firefox profile $PROFILE_DIR"
     write_environment_info
     sample_processes
@@ -413,15 +363,16 @@ shutdown() {
         return
     fi
     SHUTTING_DOWN=1
+    SHUTDOWN_STATUS=0
     log "shutting down"
 
     quit_firefox
     firefox_status=$LAST_STATUS
     FIREFOX_PID=""
     if [ "$firefox_status" -eq 0 ]; then
-        rm -f "$MARKER"
         log "Firefox shut down cleanly"
     else
+        SHUTDOWN_STATUS=$firefox_status
         log "Firefox did not shut down cleanly (status $firefox_status)"
         persist_crash_snapshot "firefox-shutdown-${firefox_status}"
     fi
@@ -448,7 +399,7 @@ cleanup() {
 
 on_signal() {
     shutdown
-    exit 0
+    exit "$SHUTDOWN_STATUS"
 }
 
 trap on_signal INT TERM
@@ -509,7 +460,6 @@ start_websockify() {
         persist_snapshot "websockify-start-failure"
         exit 1
     fi
-    NOVNC_HEALTH_FAILURES=0
 }
 
 start_websockify
@@ -544,26 +494,22 @@ while true; do
             persist_snapshot "xvnc-health-failure"
             exit 1
         fi
-        if curl --fail --silent --show-error --max-time 3 \
+        if ! curl --fail --silent --show-error --max-time 3 \
             http://127.0.0.1:6080/vnc_lite.html >/dev/null 2>&1; then
-            NOVNC_HEALTH_FAILURES=0
-        else
-            NOVNC_HEALTH_FAILURES=$((NOVNC_HEALTH_FAILURES + 1))
-            log "websockify health check failed (${NOVNC_HEALTH_FAILURES}/2)"
-            if [ "$NOVNC_HEALTH_FAILURES" -ge 2 ]; then
-                log "restarting unresponsive websockify"
-                stop_child "$NOVNC_PID" "websockify" 5
-                start_websockify
-            fi
+            log "websockify health check failed"
+            persist_snapshot "websockify-health-failure"
+            exit 1
         fi
     elif [ "$finished" = "$NOVNC_PID" ]; then
-        log "websockify exited with status $wait_status; restarting"
-        start_websockify
+        log "websockify exited with status $wait_status"
+        NOVNC_PID=""
+        persist_snapshot "websockify-exit-${wait_status}"
+        exit 1
     elif [ "$finished" = "$WM_PID" ]; then
-        log "openbox exited with status $wait_status; restarting"
-        openbox &
-        WM_PID=$!
-        log "openbox pid=$WM_PID"
+        log "openbox exited with status $wait_status"
+        WM_PID=""
+        persist_snapshot "openbox-exit-${wait_status}"
+        exit 1
     elif [ "$finished" = "$XVNC_PID" ]; then
         log "Xvnc exited with status $wait_status"
         XVNC_PID=""
@@ -573,7 +519,6 @@ while true; do
         log "Firefox exited with status $wait_status"
         FIREFOX_PID=""
         if [ "$wait_status" -eq 0 ]; then
-            rm -f "$MARKER"
             log "Firefox exited cleanly"
         else
             persist_crash_snapshot "firefox-exit-${wait_status}"

@@ -38,7 +38,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/browser", tags=["private-browser"])
 
 _DISPLAY_CONNECT_TIMEOUT_SECONDS = 5.0
-_DISPLAY_RETRY_DELAY_SECONDS = 0.5
 
 BrowserAction = Literal["back", "forward", "reload", "new-tab"]
 
@@ -374,32 +373,19 @@ async def vnc_asset(request: Request, session_id: str, asset_path: str) -> Respo
         path = f"{path}?{request.url.query}"
     try:
         upstream = await _fetch_display_asset(session.port, path)
-    except httpx.HTTPError as first_error:
-        logger.warning(
+    except httpx.HTTPError as exc:
+        logger.error(
             "Display asset request failed for %s on port %s: %s",
             session.container,
             session.port,
-            first_error,
+            exc,
         )
-        await asyncio.sleep(_DISPLAY_RETRY_DELAY_SECONDS)
-        try:
-            upstream = await _fetch_display_asset(session.port, path)
-        except httpx.HTTPError:
-            try:
-                session = await manager.recover_display(
-                    session_id, user, reason=f"noVNC asset proxy failed: {path}"
-                )
-                upstream = await _fetch_display_asset(session.port, path)
-            except BrowserError as exc:
-                logger.error("Could not recover browser display for %s: %s", session.container, exc)
-                raise BrowserUnavailable("The browser display is not responding.") from exc
-            except httpx.HTTPError as retry_error:
-                await manager.report_display_failure(
-                    session_id,
-                    user,
-                    reason=f"noVNC asset proxy still failed after recovery: {retry_error}",
-                )
-                raise BrowserUnavailable("The browser display is not responding.") from retry_error
+        await manager.report_display_failure(
+            session_id,
+            user,
+            reason=f"noVNC asset proxy failed for {path}: {exc}",
+        )
+        raise BrowserUnavailable("The browser display is not responding.") from exc
     headers = {
         key: value
         for key, value in upstream.headers.items()
@@ -442,34 +428,20 @@ async def websockify(websocket: WebSocket, session_id: str) -> None:
 
     try:
         upstream = await _connect_upstream(session, websocket)
-    except Exception as first_error:
-        logger.warning(
+    except Exception as exc:
+        logger.error(
             "WebSocket display connection failed for %s on port %s: %s",
             session.container,
             session.port,
-            first_error,
+            exc,
         )
-        await asyncio.sleep(_DISPLAY_RETRY_DELAY_SECONDS)
-        try:
-            upstream = await _connect_upstream(session, websocket)
-        except Exception:
-            try:
-                session = await manager.recover_display(
-                    session_id, user, reason="noVNC WebSocket proxy connection failed"
-                )
-                upstream = await _connect_upstream(session, websocket)
-            except BrowserError as exc:
-                logger.error("Could not recover browser display for %s: %s", session.container, exc)
-                await websocket.close(code=1011)
-                return
-            except Exception as exc:
-                await manager.report_display_failure(
-                    session_id,
-                    user,
-                    reason=f"noVNC WebSocket proxy still failed after recovery: {exc}",
-                )
-                await websocket.close(code=1011)
-                return
+        await manager.report_display_failure(
+            session_id,
+            user,
+            reason=f"noVNC WebSocket proxy connection failed: {exc}",
+        )
+        await websocket.close(code=1011)
+        return
 
     await websocket.accept(subprotocol=upstream.subprotocol)
     logger.info(

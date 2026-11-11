@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+_MEMORY_LIMIT_PATTERN = re.compile(r"^(?:\d+[bkmg]?|\d+\.\d+[bkmg])$", re.IGNORECASE)
 
 CATEGORY_LABELS: dict[str, str] = {
     "markets-energy": "Markets & Energy",
@@ -79,10 +82,31 @@ class Settings(BaseSettings):
     browser_memory_limit: str = "1200m"
     browser_cpus: str = "1.5"
     browser_pids_limit: int = Field(default=768, ge=64, le=4096)
+    browser_shm_size: str = "512m"
     browser_docker_binary: str = "docker"
 
     scheduler_enabled: bool = True
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+
+    @field_validator("browser_memory_limit", "browser_shm_size")
+    @classmethod
+    def validate_memory_limit(cls, value: str) -> str:
+        value = value.strip()
+        if not _MEMORY_LIMIT_PATTERN.fullmatch(value):
+            raise ValueError("Browser memory and shm limits must look like 1200m or 1.5g.")
+        return value
+
+    @field_validator("browser_cpus")
+    @classmethod
+    def validate_cpus(cls, value: str) -> str:
+        value = value.strip()
+        try:
+            cpus = float(value)
+        except ValueError as exc:
+            raise ValueError("Browser CPU limit must be a positive number.") from exc
+        if cpus <= 0:
+            raise ValueError("Browser CPU limit must be a positive number.")
+        return value
 
     @property
     def allowed_origins(self) -> list[str]:

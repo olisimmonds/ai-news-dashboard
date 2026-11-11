@@ -30,9 +30,60 @@ _WINDOW_SEARCH = (
 )
 _BROWSER_UID = "1000"
 _BROWSER_XAUTHORITY = "/home/browser/.Xauthority"
-_DISPLAY_RECOVERY_COOLDOWN_SECONDS = 15.0
-_DISPLAY_RECOVERY_MAX_ATTEMPTS = 2
 _SESSION_MONITOR_INTERVAL_SECONDS = 5.0
+_MISSING_RESOURCE_MARKERS = (
+    "no such container",
+    "no such object",
+    "no such network",
+    "not found",
+    "does not exist",
+)
+_MEMORY_UNITS = {
+    "b": 1,
+    "k": 1024,
+    "m": 1024**2,
+    "g": 1024**3,
+}
+_LIMIT_PROBE = (
+    "for path in /sys/fs/cgroup/memory.max "
+    "/sys/fs/cgroup/memory/memory.limit_in_bytes; do "
+    'if [ -r "$path" ]; then printf "memory_max=%s\\n" "$(cat "$path")"; break; fi; '
+    "done; "
+    "for path in /sys/fs/cgroup/pids.max /sys/fs/cgroup/pids/pids.max; do "
+    'if [ -r "$path" ]; then printf "pids_max=%s\\n" "$(cat "$path")"; break; fi; '
+    "done"
+)
+
+
+def _is_missing_resource(*values: str) -> bool:
+    text = " ".join(value for value in values if value).lower()
+    return any(marker in text for marker in _MISSING_RESOURCE_MARKERS)
+
+
+def parse_memory_limit(value: str) -> int:
+    """Convert a Docker memory string such as 1200m into bytes."""
+    text = value.strip().lower()
+    if not text:
+        raise ValueError("Memory limit cannot be empty.")
+    unit = text[-1]
+    multiplier = _MEMORY_UNITS.get(unit, 1)
+    number = text[:-1] if unit in _MEMORY_UNITS else text
+    try:
+        amount = float(number)
+    except ValueError as exc:
+        raise ValueError(f"Invalid Docker memory limit: {value!r}") from exc
+    if amount <= 0:
+        raise ValueError(f"Docker memory limit must be positive: {value!r}")
+    return int(amount * multiplier)
+
+
+def _parse_cgroup_limit(value: str | None) -> int | None:
+    if value is None or value == "max":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 class BrowserError(RuntimeError):
@@ -79,6 +130,7 @@ class ContainerSpec:
     memory: str
     cpus: str
     pids_limit: int
+    shm_size: str
 
 
 class BrowserRuntime(Protocol):
@@ -113,6 +165,7 @@ class DockerRuntime:
         self._pids_limit = settings.browser_pids_limit
         self._available: bool | None = None
         self._checked_at = 0.0
+        self._last_error: str | None = None
 
     def _browser_exec(self, name: str) -> tuple[str, ...]:
         return (
@@ -142,7 +195,10 @@ class DockerRuntime:
         except TimeoutError as exc:
             process.kill()
             await process.wait()
-            raise BrowserUnavailable("Docker did not respond in time.") from exc
+            command = " ".join((self._binary, *args))
+            raise BrowserUnavailable(
+                f"Docker did not respond within {timeout:g}s: {command}"
+            ) from exc
 
         returncode = process.returncode
         assert returncode is not None
@@ -165,27 +221,105 @@ class DockerRuntime:
         if self._available is not None and now - self._checked_at < 15:
             return self._available
         try:
-            _stdout, _stderr, returncode = await self._execute(
+            _stdout, stderr, returncode = await self._execute(
                 "version", "--format", "{{.Server.Version}}", timeout=5
             )
             self._available = returncode == 0
-        except BrowserError:
+            if self._available:
+                self._last_error = None
+            else:
+                self._last_error = stderr or f"docker version exited {returncode}"
+                logger.warning("Docker is unavailable: %s", self._last_error)
+        except BrowserError as exc:
             self._available = False
+            self._last_error = str(exc)
+            logger.warning("Docker is unavailable: %s", exc)
         self._checked_at = now
         return self._available
 
+    @property
+    def last_error(self) -> str | None:
+        return self._last_error
+
     async def _ensure_network(self) -> None:
-        _stdout, _stderr, returncode = await self._execute(
+        _stdout, stderr, returncode = await self._execute(
             "network", "inspect", self._network, timeout=10
         )
+        if returncode == 0:
+            return
+        if not _is_missing_resource(stderr):
+            error = DockerCommandError(
+                ("network", "inspect", self._network),
+                "",
+                stderr,
+                returncode,
+                summary=f"Could not inspect Docker network {self._network}",
+            )
+            logger.error("%s", error)
+            raise error
+        await self._run(
+            "network",
+            "create",
+            "--opt",
+            "com.docker.network.bridge.enable_icc=false",
+            self._network,
+            timeout=20,
+        )
+
+    async def _verify_limits(self, name: str, spec: ContainerSpec) -> None:
+        """Confirm Docker actually enforced the configured container limits."""
+        expected_memory = parse_memory_limit(spec.memory)
+        raw_host, host_error, host_code = await self._execute(
+            "inspect", "--format", "{{json .HostConfig}}", name, timeout=10
+        )
+        if host_code != 0:
+            raise DockerCommandError(
+                ("inspect", "--format", "{{json .HostConfig}}", name),
+                "",
+                host_error,
+                host_code,
+                summary="Could not inspect browser container limits",
+            )
+        host_config = json.loads(raw_host)
+        configured_memory = host_config.get("Memory")
+        configured_pids = host_config.get("PidsLimit")
+        if configured_memory != expected_memory:
+            raise BrowserUnavailable(
+                "Docker did not apply the configured memory limit "
+                f"(expected {expected_memory} bytes, HostConfig.Memory={configured_memory})."
+            )
+        if configured_pids != spec.pids_limit:
+            raise BrowserUnavailable(
+                "Docker did not apply the configured pids limit "
+                f"(expected {spec.pids_limit}, HostConfig.PidsLimit={configured_pids})."
+            )
+
+        stdout, stderr, returncode = await self._execute(
+            "exec", name, "sh", "-c", _LIMIT_PROBE, timeout=10
+        )
         if returncode != 0:
-            await self._run(
-                "network",
-                "create",
-                "--opt",
-                "com.docker.network.bridge.enable_icc=false",
-                self._network,
-                timeout=20,
+            raise BrowserUnavailable(
+                "Could not read the container cgroup limits: "
+                + (stderr or stdout or f"docker exec exited {returncode}")
+            )
+
+        probe = {}
+        for line in stdout.splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                probe[key.strip()] = value.strip()
+        memory_max = probe.get("memory_max")
+        pids_max = probe.get("pids_max")
+        if _parse_cgroup_limit(memory_max) != expected_memory:
+            raise BrowserUnavailable(
+                "Docker did not enforce the memory limit inside the container "
+                f"(cgroup memory.max={memory_max or 'missing'}, expected {expected_memory}). "
+                "Check that the host kernel exposes the memory cgroup controller."
+            )
+        if _parse_cgroup_limit(pids_max) != spec.pids_limit:
+            raise BrowserUnavailable(
+                "Docker did not enforce the pids limit inside the container "
+                f"(cgroup pids.max={pids_max or 'missing'}, expected {spec.pids_limit})."
             )
 
     async def start(self, spec: ContainerSpec) -> int:
@@ -222,7 +356,7 @@ class DockerRuntime:
                 "--cpus",
                 spec.cpus,
                 "--shm-size",
-                "512m",
+                spec.shm_size,
                 "--stop-timeout",
                 "30",
                 "--publish",
@@ -235,6 +369,7 @@ class DockerRuntime:
             mapping = await self._run("port", spec.name, f"{spec.novnc_port}/tcp", timeout=10)
             line = mapping.splitlines()[-1]
             port = int(line.rsplit(":", 1)[-1])
+            await self._verify_limits(spec.name, spec)
             await self.wait_ready(spec.name, port)
         except (BrowserError, IndexError, ValueError) as exc:
             await self._report_start_failure(spec.name, exc)
@@ -531,35 +666,68 @@ class DockerRuntime:
         if not display_ready:
             raise BrowserUnavailable("The browser display did not start in time.")
         logger.error("Firefox window not ready in %s: %s", name, window_error)
-        raise BrowserUnavailable("The browser window did not start in time.")
+        raise BrowserUnavailable(
+            f"The browser window did not start in time. Last window lookup: {window_error}"
+        )
 
     async def _disconnect_endpoint(self, name: str) -> None:
-        await self._run(
+        stdout, stderr, returncode = await self._execute(
             "network",
             "disconnect",
             "--force",
             self._network,
             name,
             timeout=10,
-            check=False,
         )
+        if returncode == 0:
+            return
+        detail = stderr or stdout
+        if _is_missing_resource(detail) or "is not connected" in detail.lower():
+            return
+        error = DockerCommandError(
+            ("network", "disconnect", "--force", self._network, name),
+            stdout,
+            stderr,
+            returncode,
+        )
+        logger.error("%s", error)
+        raise error
+
+    async def _remove_resource(self, *args: str, timeout: float) -> None:
+        stdout, stderr, returncode = await self._execute(*args, timeout=timeout)
+        if returncode == 0:
+            return
+        if _is_missing_resource(stderr, stdout):
+            logger.info("Docker resource already absent: %s", " ".join(args))
+            return
+        error = DockerCommandError(args, stdout, stderr, returncode)
+        logger.error("%s", error)
+        raise error
 
     async def remove(self, name: str) -> None:
         await self._disconnect_endpoint(name)
-        await self._run("stop", "--time", "30", name, timeout=45, check=False)
-        await self._run("rm", "--force", name, timeout=20, check=False)
+        await self._remove_resource("stop", "--time", "30", name, timeout=45)
+        await self._remove_resource("rm", "--force", name, timeout=20)
 
     async def restart(self, name: str) -> None:
         await self._run("restart", "--time", "30", name, timeout=45)
 
     async def is_running(self, name: str) -> bool:
-        try:
-            value = await self._run(
-                "inspect", "--format", "{{.State.Running}}", name, timeout=10, check=False
-            )
-            return value == "true"
-        except BrowserError:
+        stdout, stderr, returncode = await self._execute(
+            "inspect", "--format", "{{.State.Running}}", name, timeout=10
+        )
+        if returncode == 0:
+            return stdout == "true"
+        if _is_missing_resource(stderr, stdout):
             return False
+        error = DockerCommandError(
+            ("inspect", "--format", "{{.State.Running}}", name),
+            stdout,
+            stderr,
+            returncode,
+        )
+        logger.error("%s", error)
+        raise error
 
     async def run_command(self, name: str, args: list[str]) -> None:
         window = await self._find_window(name)
@@ -574,15 +742,23 @@ class DockerRuntime:
         )
 
     async def _cleanup_stale_network_endpoints(self) -> None:
-        raw = await self._run(
+        raw, stderr, returncode = await self._execute(
             "network",
             "inspect",
             "--format",
             "{{json .Containers}}",
             self._network,
             timeout=10,
-            check=False,
         )
+        if returncode != 0:
+            if _is_missing_resource(stderr):
+                return
+            raise DockerCommandError(
+                ("network", "inspect", "--format", "{{json .Containers}}", self._network),
+                "",
+                stderr,
+                returncode,
+            )
         if not raw:
             return
         try:
@@ -608,6 +784,13 @@ class DockerRuntime:
         )
         names = [line.strip() for line in output.splitlines() if line.strip()]
         for name in names:
+            try:
+                details = await self._diagnostics(name)
+                await self.persist_diagnostics(
+                    name, details, reason="orphan cleanup during startup"
+                )
+            except BrowserError:
+                logger.exception("Could not preserve diagnostics for orphan %s", name)
             await self.remove(name)
         await self._cleanup_stale_network_endpoints()
 
@@ -635,8 +818,6 @@ class BrowserSessionManager:
         self._clock = clock
         self._sessions: dict[str, BrowserSession] = {}
         self._by_user: dict[str, str] = {}
-        self._last_display_recovery: dict[str, float] = {}
-        self._display_recovery_attempts: dict[str, int] = {}
         self._dead_reported: set[str] = set()
         self._lock = asyncio.Lock()
         self._reaper: asyncio.Task[None] | None = None
@@ -700,14 +881,19 @@ class BrowserSessionManager:
             sessions = list(self._sessions.values())
             self._sessions.clear()
             self._by_user.clear()
-            self._last_display_recovery.clear()
-            self._display_recovery_attempts.clear()
             self._dead_reported.clear()
             if await self._runtime.available():
-                await asyncio.gather(
+                results = await asyncio.gather(
                     *(self._runtime.remove(session.container) for session in sessions),
                     return_exceptions=True,
                 )
+                for session, result in zip(sessions, results, strict=True):
+                    if isinstance(result, Exception):
+                        logger.error(
+                            "Could not remove browser container %s: %s",
+                            session.container,
+                            result,
+                        )
 
     async def get_or_create(self, username: str) -> BrowserSession:
         if not self.enabled:
@@ -723,8 +909,6 @@ class BrowserSessionManager:
                 )
                 self._sessions.pop(existing.id, None)
                 self._by_user.pop(username, None)
-                self._display_recovery_attempts.pop(existing.id, None)
-                self._last_display_recovery.pop(existing.id, None)
                 self._dead_reported.discard(existing.id)
 
             if len(self._sessions) >= self._settings.browser_max_sessions:
@@ -747,7 +931,6 @@ class BrowserSessionManager:
             )
             self._sessions[session_id] = session
             self._by_user[username] = session_id
-            self._display_recovery_attempts[session_id] = 0
             return session
 
     async def remove(self, session_id: str, username: str) -> None:
@@ -755,68 +938,18 @@ class BrowserSessionManager:
             session = self.get(session_id, username)
             self._sessions.pop(session_id, None)
             self._by_user.pop(username, None)
-            self._last_display_recovery.pop(session_id, None)
-            self._display_recovery_attempts.pop(session_id, None)
             self._dead_reported.discard(session_id)
         try:
             await self._runtime.remove(session.container)
         except BrowserError:
-            logger.warning("Could not remove browser container %s", session.container)
+            logger.error("Could not remove browser container %s", session.container)
+            raise
 
     async def restart(self, session_id: str, username: str) -> BrowserSession:
         async with self._lock:
             session = self.get(session_id, username)
-            self._display_recovery_attempts[session_id] = 0
-            await self._restart_or_recreate(session, username)
-            now = self._clock()
-            self._last_display_recovery[session_id] = now
-            session.last_activity = now
-            return session
-
-    async def recover_display(
-        self, session_id: str, username: str, *, reason: str
-    ) -> BrowserSession:
-        async with self._lock:
-            session = self.get(session_id, username)
-            attempts = self._display_recovery_attempts.get(session_id, 0)
-            if attempts >= _DISPLAY_RECOVERY_MAX_ATTEMPTS:
-                logger.error(
-                    "Browser display recovery limit reached for %s; manual restart required",
-                    session.container,
-                )
-                raise BrowserUnavailable(
-                    "The browser display could not be recovered after "
-                    f"{_DISPLAY_RECOVERY_MAX_ATTEMPTS} automatic attempts. "
-                    "Restart the browser session manually."
-                )
-            now = self._clock()
-            last = self._last_display_recovery.get(session_id, 0.0)
-            if now - last < _DISPLAY_RECOVERY_COOLDOWN_SECONDS:
-                logger.info(
-                    "Skipping duplicate display recovery for %s; retrying display",
-                    session.container,
-                )
-                return session
-            attempts += 1
-            self._display_recovery_attempts[session_id] = attempts
-            self._last_display_recovery[session_id] = now
-            logger.info(
-                "Recovering browser display for %s (attempt %s/%s)",
-                session.container,
-                attempts,
-                _DISPLAY_RECOVERY_MAX_ATTEMPTS,
-            )
-            await self.report_display_failure(session_id, username, reason=reason)
-            try:
-                await self._restart_or_recreate(session, username)
-            except BrowserError as exc:
-                logger.error("Browser display recovery failed for %s: %s", session.container, exc)
-                raise BrowserUnavailable(
-                    "The browser display could not be recovered after "
-                    f"{attempts} automatic attempt(s)."
-                ) from exc
+            await self._restart_session(session, username)
             session.last_activity = self._clock()
-            logger.info("Recovered browser display for %s", session.container)
             return session
 
     async def report_display_failure(self, session_id: str, username: str, *, reason: str) -> None:
@@ -842,7 +975,7 @@ class BrowserSessionManager:
             logger.error("Saved browser diagnostics for %s to %s", container, path)
         return path
 
-    async def _restart_or_recreate(self, session: BrowserSession, username: str) -> None:
+    async def _restart_session(self, session: BrowserSession, username: str) -> None:
         if await self._runtime.is_running(session.container):
             try:
                 await self._runtime.restart(session.container)
@@ -850,13 +983,14 @@ class BrowserSessionManager:
                 return
             except BrowserError as exc:
                 logger.error(
-                    "Browser container %s did not recover from restart: %s",
+                    "Browser container %s did not restart cleanly: %s",
                     session.container,
                     exc,
                 )
                 await self._record_diagnostics(session.container, f"restart failed: {exc}")
+                raise
+        logger.info("Starting stopped browser container %s", session.container)
         await self._runtime.remove(session.container)
-        logger.info("Recreating browser container %s", session.container)
         session.port = await self._runtime.start(self._spec(username))
 
     def _spec(self, username: str) -> ContainerSpec:
@@ -870,6 +1004,7 @@ class BrowserSessionManager:
             memory=self._settings.browser_memory_limit,
             cpus=self._settings.browser_cpus,
             pids_limit=self._settings.browser_pids_limit,
+            shm_size=self._settings.browser_shm_size,
         )
 
     async def navigate(

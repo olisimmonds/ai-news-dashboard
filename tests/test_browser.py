@@ -8,6 +8,7 @@ from pathlib import Path
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from ai_dashboard.browser import api as browser_api
 from ai_dashboard.browser.auth import BrowserAuth, hash_password, save_accounts, verify_password
@@ -18,8 +19,10 @@ from ai_dashboard.browser.sessions import (
     BrowserSessionManager,
     BrowserUnavailable,
     ContainerSpec,
+    DockerCommandError,
     DockerRuntime,
     normalise_target,
+    parse_memory_limit,
 )
 from ai_dashboard.config import Settings
 from ai_dashboard.main import create_app
@@ -39,6 +42,7 @@ class FakeRuntime:
         self.diagnostics_calls: list[str] = []
         self.persisted: list[tuple[str, str]] = []
         self.fail_ready = False
+        self.remove_error: BrowserError | None = None
 
     async def available(self) -> bool:
         return True
@@ -56,6 +60,8 @@ class FakeRuntime:
             raise BrowserUnavailable("The browser window did not start in time.")
 
     async def remove(self, name: str) -> None:
+        if self.remove_error is not None:
+            raise self.remove_error
         self.removals.append(name)
         self.running.discard(name)
 
@@ -94,6 +100,63 @@ def browser_settings(settings: Settings, tmp_path: Path) -> Settings:
             "browser_max_sessions": 2,
         }
     )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"browser_memory_limit": "banana"}, "memory and shm limits"),
+        ({"browser_memory_limit": "1.5"}, "memory and shm limits"),
+        ({"browser_shm_size": "512 mb"}, "memory and shm limits"),
+        ({"browser_cpus": "0"}, "CPU limit"),
+        ({"browser_cpus": "fast"}, "CPU limit"),
+    ],
+)
+def test_browser_resource_settings_reject_invalid_limits(
+    browser_settings: Settings,
+    overrides: dict[str, str],
+    message: str,
+) -> None:
+    base = browser_settings.model_dump()
+
+    with pytest.raises(ValidationError, match=message):
+        Settings.model_validate({**base, **overrides})
+
+
+def test_browser_resource_settings_accept_valid_limits(browser_settings: Settings) -> None:
+    configured = Settings.model_validate(
+        {
+            **browser_settings.model_dump(),
+            "browser_memory_limit": "1.5g",
+            "browser_shm_size": "256m",
+            "browser_cpus": "2",
+        }
+    )
+
+    assert configured.browser_memory_limit == "1.5g"
+    assert configured.browser_shm_size == "256m"
+    assert configured.browser_cpus == "2"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("1200m", 1258291200),
+        ("512M", 536870912),
+        ("1.5g", 1610612736),
+        ("2048k", 2097152),
+        ("1048576", 1048576),
+        ("1b", 1),
+    ],
+)
+def test_parse_memory_limit(value: str, expected: int) -> None:
+    assert parse_memory_limit(value) == expected
+
+
+@pytest.mark.parametrize("value", ["", "banana", "0m", "-1m"])
+def test_parse_memory_limit_rejects_invalid_values(value: str) -> None:
+    with pytest.raises(ValueError):
+        parse_memory_limit(value)
 
 
 def seed_accounts(settings: Settings, usernames: tuple[str, ...] = ("alice",)) -> None:
@@ -217,7 +280,7 @@ def test_browser_session_is_reused_and_can_be_closed(
     assert runtime.removals
 
 
-def test_vnc_asset_retries_transient_proxy_failure_without_restart(
+def test_vnc_asset_reports_display_failure_without_restart(
     browser_settings: Settings,
     sources: list[SourceConfig],
     monkeypatch: pytest.MonkeyPatch,
@@ -228,11 +291,8 @@ def test_vnc_asset_retries_transient_proxy_failure_without_restart(
     async def fake_fetch(port: int, path: str) -> httpx.Response:
         nonlocal calls
         calls += 1
-        if calls == 1:
-            raise httpx.ConnectError("websockify temporarily unavailable")
-        return httpx.Response(200, content=b"noVNC", headers={"content-type": "text/html"})
+        raise httpx.ConnectError("websockify is not responding")
 
-    monkeypatch.setattr(browser_api, "_DISPLAY_RETRY_DELAY_SECONDS", 0)
     monkeypatch.setattr(browser_api, "_fetch_display_asset", fake_fetch)
 
     with client:
@@ -240,39 +300,19 @@ def test_vnc_asset_retries_transient_proxy_failure_without_restart(
         session = client.post("/api/browser/sessions", json={}).json()
         response = client.get(f"/api/browser/sessions/{session['id']}/vnc/vnc_lite.html")
 
-    assert response.status_code == 200
-    assert response.content == b"noVNC"
+    assert response.status_code == 503
+    assert calls == 1
     assert runtime.restarts == []
-
-
-def test_vnc_asset_recovers_dead_display_without_changing_profile(
-    browser_settings: Settings,
-    sources: list[SourceConfig],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    client, runtime = make_app(browser_settings, sources)
-    calls = 0
-
-    async def fake_fetch(port: int, path: str) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        if calls < 3:
-            raise httpx.ConnectError("websockify is not responding")
-        return httpx.Response(200, content=b"noVNC", headers={"content-type": "text/html"})
-
-    monkeypatch.setattr(browser_api, "_DISPLAY_RETRY_DELAY_SECONDS", 0)
-    monkeypatch.setattr(browser_api, "_fetch_display_asset", fake_fetch)
-
-    with client:
-        login(client)
-        session = client.post("/api/browser/sessions", json={}).json()
-        response = client.get(f"/api/browser/sessions/{session['id']}/vnc/vnc_lite.html")
-
-    assert response.status_code == 200
-    assert runtime.restarts == [runtime.starts[0].name]
     assert runtime.diagnostics_calls == [runtime.starts[0].name]
     assert len(runtime.starts) == 1
     assert runtime.starts[0].volume.startswith("meridian-browser-home-")
+    assert runtime.persisted == [
+        (
+            runtime.starts[0].name,
+            "display failure on port 41001: noVNC asset proxy failed for "
+            "/vnc_lite.html: websockify is not responding",
+        )
+    ]
 
 
 def test_browser_rejects_privileged_or_invalid_targets(
@@ -394,88 +434,53 @@ async def test_manager_waits_for_display_after_running_restart(
     assert restarted.id == session.id
 
 
-async def test_manager_recreates_container_when_restart_never_becomes_ready(
+async def test_manager_restart_propagates_failure_without_recreating(
     browser_settings: Settings,
 ) -> None:
     runtime = FakeRuntime()
     manager = BrowserSessionManager(browser_settings, runtime)
     session = await manager.get_or_create("alice")
-    first_port = session.port
     runtime.fail_ready = True
 
-    restarted = await manager.restart(session.id, "alice")
+    with pytest.raises(BrowserUnavailable, match="window"):
+        await manager.restart(session.id, "alice")
 
     assert runtime.restarts == [session.container]
-    assert runtime.removals == [session.container]
-    assert len(runtime.starts) == 2
-    assert restarted.port != first_port
-    assert runtime.starts[0].volume == runtime.starts[1].volume
+    assert runtime.removals == []
+    assert len(runtime.starts) == 1
+    assert runtime.diagnostics_calls == [session.container]
+    assert runtime.persisted[0][1].startswith("restart failed: ")
 
 
-async def test_manager_recovers_display_and_keeps_profile_volume(
+async def test_manager_reports_display_failure_without_restart(
     browser_settings: Settings,
 ) -> None:
     runtime = FakeRuntime()
     manager = BrowserSessionManager(browser_settings, runtime)
     session = await manager.get_or_create("alice")
 
-    recovered = await manager.recover_display(
-        session.id, "alice", reason="noVNC asset request failed"
-    )
+    await manager.report_display_failure(session.id, "alice", reason="noVNC asset request failed")
 
-    assert recovered.id == session.id
-    assert recovered.port == session.port
-    assert runtime.restarts == [session.container]
+    assert runtime.restarts == []
     assert runtime.diagnostics_calls == [session.container]
     assert runtime.persisted == [
         (session.container, "display failure on port 41001: noVNC asset request failed")
     ]
     assert len(runtime.starts) == 1
-    assert runtime.starts[0].volume.startswith("meridian-browser-home-")
-
-    again = await manager.recover_display(session.id, "alice", reason="display still failing")
-    assert again.id == session.id
-    assert runtime.restarts == [session.container]
-    assert runtime.diagnostics_calls == [session.container]
 
 
-async def test_manager_caps_display_recovery_attempts(browser_settings: Settings) -> None:
+async def test_manager_remove_propagates_docker_failure(browser_settings: Settings) -> None:
     runtime = FakeRuntime()
-    now = [1000.0]
-    manager = BrowserSessionManager(browser_settings, runtime, clock=lambda: now[0])
+    manager = BrowserSessionManager(browser_settings, runtime)
     session = await manager.get_or_create("alice")
+    runtime.remove_error = DockerCommandError(
+        ("rm", "--force", session.container), "", "device or resource busy", 1
+    )
 
-    await manager.recover_display(session.id, "alice", reason="first failure")
-    now[0] += 16
-    await manager.recover_display(session.id, "alice", reason="second failure")
+    with pytest.raises(DockerCommandError, match="device or resource busy"):
+        await manager.remove(session.id, "alice")
 
-    with pytest.raises(BrowserUnavailable, match="2 automatic attempts"):
-        await manager.recover_display(session.id, "alice", reason="third failure")
-
-    assert runtime.restarts == [session.container, session.container]
-    assert len(runtime.diagnostics_calls) == 2
-
-
-async def test_manager_manual_restart_resets_display_recovery_limit(
-    browser_settings: Settings,
-) -> None:
-    runtime = FakeRuntime()
-    now = [1000.0]
-    manager = BrowserSessionManager(browser_settings, runtime, clock=lambda: now[0])
-    session = await manager.get_or_create("alice")
-
-    for attempt in range(2):
-        await manager.recover_display(session.id, "alice", reason=f"failure {attempt}")
-        now[0] += 16
-    with pytest.raises(BrowserUnavailable):
-        await manager.recover_display(session.id, "alice", reason="limit reached")
-
-    await manager.restart(session.id, "alice")
-    now[0] += 16
-    recovered = await manager.recover_display(session.id, "alice", reason="after manual restart")
-
-    assert recovered.id == session.id
-    assert len(runtime.restarts) == 4
+    assert manager.active_count == 0
 
 
 def test_manager_stop_removes_sessions(browser_settings: Settings) -> None:
@@ -554,6 +559,7 @@ def test_docker_start_reports_diagnostics_before_cleanup(
         return ""
 
     async def fake_execute(*args: str, timeout: float = 20.0) -> tuple[str, str, int]:
+        events.append(f"execute:{args[0]}")
         return "", "", 0
 
     async def fake_diagnostics(name: str) -> str:
@@ -564,9 +570,13 @@ def test_docker_start_reports_diagnostics_before_cleanup(
         events.append("wait_ready")
         raise BrowserUnavailable("The browser window did not start in time.")
 
+    async def fake_verify_limits(name: str, spec: ContainerSpec) -> None:
+        events.append("verify_limits")
+
     monkeypatch.setattr(runtime, "_execute", fake_execute)
     monkeypatch.setattr(runtime, "_run", fake_run)
     monkeypatch.setattr(runtime, "_diagnostics", fake_diagnostics)
+    monkeypatch.setattr(runtime, "_verify_limits", fake_verify_limits)
     monkeypatch.setattr(runtime, "wait_ready", fake_wait_ready)
 
     spec = ContainerSpec(
@@ -578,6 +588,7 @@ def test_docker_start_reports_diagnostics_before_cleanup(
         memory="1200m",
         cpus="1.5",
         pids_limit=768,
+        shm_size="512m",
     )
 
     with caplog.at_level(logging.ERROR), pytest.raises(BrowserUnavailable, match="window"):
@@ -588,8 +599,11 @@ def test_docker_start_reports_diagnostics_before_cleanup(
     assert "--stop-timeout" in run_args
     assert run_args[run_args.index("--stop-timeout") + 1] == "30"
     assert run_args[run_args.index("--pids-limit") + 1] == "768"
+    assert run_args[run_args.index("--shm-size") + 1] == "512m"
 
-    cleanup_index = max(index for index, event in enumerate(events) if event == "run:rm")
+    cleanup_index = max(
+        index for index, event in enumerate(events) if event in {"run:rm", "execute:rm"}
+    )
     assert events.index("diagnostics") < cleanup_index
     assert "Firefox failed to start" in caplog.text
 
@@ -658,6 +672,150 @@ def test_docker_command_error_preserves_stdout_and_full_command(
     assert "exec --user 1000 container xdotool" in message
     assert "exit 1" in message
     assert "xdotool: search failed" in message
+
+
+def test_docker_is_running_distinguishes_missing_from_docker_failure(
+    browser_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = DockerRuntime(browser_settings)
+
+    async def missing(*args: str, timeout: float = 20.0) -> tuple[str, str, int]:
+        return "", "Error response from daemon: No such container: test", 1
+
+    monkeypatch.setattr(runtime, "_execute", missing)
+    assert asyncio.run(runtime.is_running("test")) is False
+
+    async def unavailable(*args: str, timeout: float = 20.0) -> tuple[str, str, int]:
+        return "", "Cannot connect to the Docker daemon at unix:///var/run/docker.sock", 1
+
+    monkeypatch.setattr(runtime, "_execute", unavailable)
+    with pytest.raises(DockerCommandError, match="Cannot connect to the Docker daemon"):
+        asyncio.run(runtime.is_running("test"))
+
+
+def test_docker_only_creates_network_when_it_is_missing(
+    browser_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = DockerRuntime(browser_settings)
+    created: list[tuple[str, ...]] = []
+
+    async def fake_run(*args: str, timeout: float = 20.0, check: bool = True) -> str:
+        created.append(args)
+        return ""
+
+    async def missing(*args: str, timeout: float = 20.0) -> tuple[str, str, int]:
+        return "", f"network {browser_settings.browser_network} not found", 1
+
+    monkeypatch.setattr(runtime, "_run", fake_run)
+    monkeypatch.setattr(runtime, "_execute", missing)
+    asyncio.run(runtime._ensure_network())
+    assert created[0][:2] == ("network", "create")
+
+    created.clear()
+
+    async def unavailable(*args: str, timeout: float = 20.0) -> tuple[str, str, int]:
+        return "", "Cannot connect to the Docker daemon at unix:///var/run/docker.sock", 1
+
+    monkeypatch.setattr(runtime, "_execute", unavailable)
+    with pytest.raises(DockerCommandError, match="Could not inspect Docker network"):
+        asyncio.run(runtime._ensure_network())
+    assert created == []
+
+
+def test_docker_verifies_enforced_cgroup_limits(
+    browser_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = DockerRuntime(browser_settings)
+    spec = ContainerSpec(
+        name="meridian-browser-test",
+        image="meridian-firefox:test",
+        volume="meridian-browser-home-test",
+        network="meridian-browser-test",
+        novnc_port=6080,
+        memory="1200m",
+        cpus="1.5",
+        pids_limit=768,
+        shm_size="512m",
+    )
+
+    async def enforced(*args: str, timeout: float = 20.0) -> tuple[str, str, int]:
+        if args[0] == "inspect":
+            return json.dumps({"Memory": 1258291200, "PidsLimit": 768}), "", 0
+        return "memory_max=1258291200\npids_max=768\n", "", 0
+
+    monkeypatch.setattr(runtime, "_execute", enforced)
+    asyncio.run(runtime._verify_limits(spec.name, spec))
+
+    async def unenforced(*args: str, timeout: float = 20.0) -> tuple[str, str, int]:
+        if args[0] == "inspect":
+            return json.dumps({"Memory": 0, "PidsLimit": 768}), "", 0
+        return "memory_max=max\npids_max=768\n", "", 0
+
+    monkeypatch.setattr(runtime, "_execute", unenforced)
+    with pytest.raises(BrowserUnavailable, match="memory limit"):
+        asyncio.run(runtime._verify_limits(spec.name, spec))
+
+    async def host_pids_unenforced(*args: str, timeout: float = 20.0) -> tuple[str, str, int]:
+        if args[0] == "inspect":
+            return json.dumps({"Memory": 1258291200, "PidsLimit": 999}), "", 0
+        return "memory_max=1258291200\npids_max=768\n", "", 0
+
+    monkeypatch.setattr(runtime, "_execute", host_pids_unenforced)
+    with pytest.raises(BrowserUnavailable, match="pids limit"):
+        asyncio.run(runtime._verify_limits(spec.name, spec))
+
+    async def cgroup_pids_unenforced(*args: str, timeout: float = 20.0) -> tuple[str, str, int]:
+        if args[0] == "inspect":
+            return json.dumps({"Memory": 1258291200, "PidsLimit": 768}), "", 0
+        return "memory_max=1258291200\npids_max=max\n", "", 0
+
+    monkeypatch.setattr(runtime, "_execute", cgroup_pids_unenforced)
+    with pytest.raises(BrowserUnavailable, match="pids limit"):
+        asyncio.run(runtime._verify_limits(spec.name, spec))
+
+
+def test_cleanup_orphans_preserves_diagnostics_before_removal(
+    browser_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = DockerRuntime(browser_settings)
+    events: list[str] = []
+
+    async def fake_run(*args: str, timeout: float = 20.0, check: bool = True) -> str:
+        if args[:2] == ("ps", "--all"):
+            return "meridian-browser-orphan\n"
+        return ""
+
+    async def fake_execute(*args: str, timeout: float = 20.0) -> tuple[str, str, int]:
+        return "", "", 0
+
+    async def fake_diagnostics(name: str) -> str:
+        events.append("diagnostics")
+        return "state: exited"
+
+    async def fake_persist(name: str, details: str, *, reason: str) -> str | None:
+        events.append(f"persist:{reason}")
+        return "/tmp/diagnostics.log"
+
+    async def fake_remove(name: str) -> None:
+        events.append("remove")
+
+    monkeypatch.setattr(runtime, "_run", fake_run)
+    monkeypatch.setattr(runtime, "_execute", fake_execute)
+    monkeypatch.setattr(runtime, "_diagnostics", fake_diagnostics)
+    monkeypatch.setattr(runtime, "persist_diagnostics", fake_persist)
+    monkeypatch.setattr(runtime, "remove", fake_remove)
+
+    asyncio.run(runtime.cleanup_orphans())
+
+    assert events == [
+        "diagnostics",
+        "persist:orphan cleanup during startup",
+        "remove",
+    ]
 
 
 def test_find_window_failure_preserves_xdotool_stderr(
@@ -784,15 +942,17 @@ def test_docker_diagnostics_report_oom_processes_and_resources(
     assert "Firefox content process terminated" in diagnostics
 
 
-def test_container_supervisor_restarts_websockify_and_health_checks_display() -> None:
+def test_container_supervisor_fails_fast_when_display_processes_exit() -> None:
     script = (
         Path(__file__).resolve().parents[1] / "docker" / "firefox" / "start-session.sh"
     ).read_text(encoding="utf-8")
 
     assert script.startswith("#!/bin/bash")
     assert "wait -n -p" in script
-    assert "restarting unresponsive websockify" in script
+    assert "restarting unresponsive websockify" not in script
     assert "websockify exited with status" in script
+    assert 'persist_snapshot "websockify-health-failure"' in script
+    assert 'persist_snapshot "openbox-exit-${wait_status}"' in script
     assert "Xvnc health check failed" in script
 
 
@@ -804,8 +964,7 @@ def test_firefox_policy_limits_content_processes_and_memory_pressure() -> None:
     )
     preferences = policies["policies"]["Preferences"]
 
-    assert preferences["dom.ipc.forkserver.enable"]["Value"] is False
-    assert preferences["dom.ipc.forkserver.enable"]["Status"] == "locked"
+    assert "dom.ipc.forkserver.enable" not in preferences
     assert preferences["dom.ipc.processCount"]["Value"] == 2
     assert preferences["dom.ipc.processCount.file"]["Value"] == 1
     assert preferences["dom.ipc.processCount.extension"]["Value"] == 1
@@ -818,7 +977,7 @@ def test_firefox_policy_limits_content_processes_and_memory_pressure() -> None:
     assert preferences["browser.sessionstore.resume_from_crash"]["Value"] is False
 
 
-def test_container_supervisor_shuts_down_cleanly_and_quarantines_crash_state() -> None:
+def test_container_supervisor_shuts_down_and_preserves_crash_evidence() -> None:
     script = (
         Path(__file__).resolve().parents[1] / "docker" / "firefox" / "start-session.sh"
     ).read_text(encoding="utf-8")
@@ -827,15 +986,15 @@ def test_container_supervisor_shuts_down_cleanly_and_quarantines_crash_state() -
     assert "trap cleanup EXIT" in script
     assert "ctrl+q" in script
     assert 'stop_child "$FIREFOX_PID" "Firefox" 10' in script
-    assert "unclean-shutdown" in script
+    assert "unclean-shutdown" not in script
+    assert "session-quarantine" not in script
     assert "profile-path" in script
     assert "profiles.ini" in script
     assert '--profile "$PROFILE_DIR"' in script
-    assert "sessionstore.jsonlz4" in script
-    assert "sessionCheckpoints.json" in script
-    assert "sessionstore-backups" in script
+    assert "sessionstore.jsonlz4" not in script
+    assert 'mv "$profile/$name"' not in script
     assert "resume_from_crash" in script
-    assert "dom.ipc.forkserver.enable" in script
+    assert "dom.ipc.forkserver.enable" not in script
     assert "dom.ipc.processCount" in script
     assert "memory.events" in script
     assert "sending SIGKILL" in script
@@ -848,6 +1007,7 @@ def test_container_supervisor_shuts_down_cleanly_and_quarantines_crash_state() -
     assert "firefox-esr --version" in script
     assert "dpkg-query" in script
     assert "firefox-esr-version" in script
+    assert 'exit "$SHUTDOWN_STATUS"' in script
 
 
 def test_container_image_collects_crashes_and_uses_graceful_stop() -> None:
@@ -887,10 +1047,15 @@ def test_docker_uses_graceful_stop_and_restart_timeouts(
     runtime = DockerRuntime(browser_settings)
     calls: list[tuple[str, ...]] = []
 
+    async def fake_execute(*args: str, timeout: float = 20.0) -> tuple[str, str, int]:
+        calls.append(args)
+        return "", "", 0
+
     async def fake_run(*args: str, timeout: float = 20.0, check: bool = True) -> str:
         calls.append(args)
         return ""
 
+    monkeypatch.setattr(runtime, "_execute", fake_execute)
     monkeypatch.setattr(runtime, "_run", fake_run)
 
     asyncio.run(runtime.remove("meridian-browser-test"))
@@ -932,8 +1097,19 @@ def test_docker_cleanup_removes_stale_browser_network_endpoints(
 
     async def fake_execute(*args: str, timeout: float = 20.0) -> tuple[str, str, int]:
         calls.append(args)
+        if args[:2] == ("network", "inspect"):
+            return (
+                json.dumps(
+                    {
+                        "one": {"Name": "meridian-browser-stale"},
+                        "two": {"Name": "other-service"},
+                    }
+                ),
+                "",
+                0,
+            )
         if args[0] == "inspect":
-            if args[1] == "meridian-browser-live":
+            if "meridian-browser-live" in args:
                 return "{}", "", 0
             return "", "No such container", 1
         return "", "", 0
